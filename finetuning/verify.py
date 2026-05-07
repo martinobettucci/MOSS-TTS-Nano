@@ -15,8 +15,6 @@ DEFAULT_CHECKPOINT_PATH = REPO_ROOT / "models" / "MOSS-TTS-Nano"
 DEFAULT_CODEC_PATH = REPO_ROOT / "models" / "MOSS-Audio-Tokenizer-Nano"
 DEFAULT_OUTPUT_AUDIO_PATH = REPO_ROOT / "generated_audio" / "finetune_verify.wav"
 MOSS_AUDIO_TOKENIZER_TYPE = "moss-audio-tokenizer-nano"
-QUANT_MODES = {"fp8", "fp4", "int8"}
-CUDA_ONLY_QUANT = {"fp8", "fp4"}
 FAST_DECODE_CHUNK_FRAMES = 8
 FAST_AUDIO_TEMPERATURE = 0.8
 FAST_AUDIO_TOP_P = 0.95
@@ -47,7 +45,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--text-tokenizer-path", default=None)
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--dtype", default="auto", choices=("auto", "float32", "float16", "bfloat16", "fp8", "fp4", "int8"))
+    parser.add_argument("--dtype", default="auto", choices=("auto", "float32", "float16", "bfloat16"))
     parser.add_argument("--nq", type=int, default=None, help="Number of VQ channels to decode (1-16). Lower = faster, lower quality.")
     parser.add_argument("--max-new-frames", type=int, default=375)
     parser.add_argument("--do-sample", type=int, nargs="?", const=1, default=1, choices=[0, 1])
@@ -68,18 +66,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Run a warmup inference pass before timing (warms CUDA kernels, counted in model_load_s).",
     )
     parser.add_argument(
-        "--compile",
-        action="store_true",
-        default=False,
-        help="Apply torch.compile to the transformer for faster inference (requires warmup for best results).",
-    )
-    parser.add_argument(
         "--tries",
         type=int,
         default=1,
         metavar="N",
         help=(
-            "Run N timed inferences (after warmup/compile) and report per-run and aggregate stats. "
+            "Run N timed inferences after warmup and report per-run and aggregate stats. "
             "Must be >= 1. Default: 1."
         ),
     )
@@ -90,18 +82,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help=(
             "Use the optimised direct loop (no inference_stream generator overhead, "
             "KV cache enabled for local transformer). Continuation mode only."
-        ),
-    )
-    parser.add_argument(
-        "--local-2pass",
-        dest="local_two_pass",
-        action="store_true",
-        default=False,
-        help=(
-            "With --fast: use two full-sequence passes for the local decoder "
-            "(~1.5 ms) instead of 17 × KV-cache 1-token calls (~9.4 ms). "
-            "Pass-1 samples approximate tokens; pass-2 refines with actual embeddings. "
-            "Slight quality tradeoff for channels > 2; enables near 0.25 RTF targets."
         ),
     )
     return parser.parse_args(argv)
@@ -144,85 +124,6 @@ def resolve_dtype(dtype_arg: str, device: torch.device) -> torch.dtype:
 def _cuda_sync(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize()
-
-
-def _bf16_or_fp16(device: torch.device) -> torch.dtype:
-    if device.type == "cuda" and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
-        return torch.bfloat16
-    return torch.float16
-
-
-def _load_quantized_model(checkpoint: str, device: torch.device, dtype_arg: str) -> AutoModelForCausalLM:
-    if dtype_arg in CUDA_ONLY_QUANT and device.type != "cuda":
-        raise SystemExit(
-            f"[error] --dtype {dtype_arg} requires CUDA — pass --gpu in tts_infer.py"
-        )
-
-    if dtype_arg == "fp4":
-        from transformers import BitsAndBytesConfig
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="fp4",
-            bnb_4bit_compute_dtype=_bf16_or_fp16(device),
-        )
-        return AutoModelForCausalLM.from_pretrained(
-            checkpoint, quantization_config=bnb_config, trust_remote_code=True
-        )
-
-    if dtype_arg == "fp8":
-        from torchao.quantization import Float8WeightOnlyConfig, quantize_
-        model = AutoModelForCausalLM.from_pretrained(checkpoint, trust_remote_code=True)
-        model.to(device=device, dtype=_bf16_or_fp16(device))
-        quantize_(model, Float8WeightOnlyConfig())
-        return model
-
-    if dtype_arg == "int8":
-        import warnings
-        warnings.filterwarnings("ignore", category=UserWarning, module="torchao")
-        from torchao.quantization import Int8WeightOnlyConfig, quantize_
-        base_dtype = _bf16_or_fp16(device) if device.type == "cuda" else torch.float32
-        if device.type != "cuda":
-            print(
-                "[int8] Note: on CPU, INT8 weight-only reduces model RAM by ~50% "
-                "but does not speed up inference on this hardware (torchao 0.17 / ARM). "
-                "Use float32 for best latency.",
-                flush=True,
-            )
-        model = AutoModelForCausalLM.from_pretrained(checkpoint, trust_remote_code=True)
-        model.to(device=device, dtype=base_dtype)
-        quantize_(model, Int8WeightOnlyConfig(version=2))
-        return model
-
-    raise ValueError(f"Unknown quant mode: {dtype_arg}")
-
-
-def _apply_compile(model: AutoModelForCausalLM, device: torch.device) -> None:
-    """Apply torch.compile to the hot inference paths.
-
-    Uses 'default' mode with dynamic=True to handle variable sequence lengths
-    and KV-cache growth safely (CUDA-graph mode conflicts with rotary pos emb + KV cache).
-    """
-    if device.type != "cuda":
-        print("[compile] torch.compile skipped: not a CUDA device", flush=True)
-        return
-    try:
-        import torch._dynamo
-        torch._dynamo.config.suppress_errors = True
-        model.transformer = torch.compile(
-            model.transformer,
-            mode="default",
-            fullgraph=False,
-            dynamic=True,
-        )
-        model.local_transformer = torch.compile(
-            model.local_transformer,
-            mode="default",
-            fullgraph=False,
-            dynamic=True,
-        )
-        print("[compile] torch.compile applied (mode=default, dynamic=True)", flush=True)
-    except Exception as exc:
-        print(f"[compile] torch.compile failed ({exc}), continuing without compile", flush=True)
 
 
 def _sample_audio(
@@ -307,86 +208,6 @@ def _local_transformer_step(
         cu_seqlens=None,
         num_sequences=None,
     )
-
-
-@torch.inference_mode()
-def _local_decode_frame_twopass(
-    model: AutoModelForCausalLM,
-    g_h: "torch.Tensor",
-    eff_nq: int,
-    do_sample: bool,
-    slot_id: int,
-    end_id: int,
-    audio_pad: int,
-    device: "torch.device",
-    # pre-stacked weight tensors to avoid re-stacking per frame
-    lm_weights: "torch.Tensor | None" = None,   # (n_vq, codebook, emb)
-    emb_weights: "torch.Tensor | None" = None,  # (n_vq, codebook, emb)
-    slot_emb: "torch.Tensor | None" = None,     # (emb,) pre-embedded slot token
-) -> "tuple[bool, list[int]]":
-    """
-    Decode one full local frame using a two-pass full-sequence approach.
-
-    Pass-1 (0.70 ms):  run all (n_vq+1) positions in ONE forward call with
-                       global_h at position-0 and zeros at positions 1-n_vq.
-                       - Position-0 logit is EXACT (causal: attends only to itself).
-                       - Positions 1+ logits are approximate (zero-embedding inputs).
-                       Use pass-1 to determine the text decision and to build the
-                       approximate token sequence for pass-2.
-
-    Pass-2 (0.70 ms):  re-run with actual embeddings at every position (from pass-1
-                       approximate tokens).
-                       - Each position k now has the correct embeddings for positions 0..k-1
-                         (from pass-1 tokens), so logits are GREATLY IMPROVED.
-                       - For ch0 the logit is now EXACT (text_emb at position-1 is correct).
-                       - For later channels the logit uses pass-1 approximate tokens which
-                         are typically close to the final answer.
-
-    Total: ~1.5 ms for 2 full-sequence passes vs ~9.4 ms for 17 × KV-cache 1-token steps.
-    """
-    ldtype = g_h.dtype
-    n_vq = model.config.n_vq
-    emb_dim = g_h.shape[-1]
-
-    # ---------- pass 1: all zeros for positions 1-n_vq ----------
-    seq1 = torch.zeros(1, n_vq + 1, emb_dim, dtype=ldtype, device=device)
-    seq1[:, 0] = g_h.squeeze(1)
-
-    out1 = model.local_transformer(inputs_embeds=seq1, use_cache=False, return_dict=True)
-    hs1 = out1.last_hidden_state  # (1, n_vq+1, emb_dim)
-
-    # text decision from position 0 — this is EXACT
-    text_logits = model.text_lm_head(hs1[:, 0])
-    if text_logits[0, end_id] >= text_logits[0, slot_id]:
-        return False, []
-
-    # approximate tokens from pass-1 (wrong embeddings → wrong logits, but close)
-    approx_tokens: list[int] = []
-    for ch in range(eff_nq):
-        ch_logits = model.audio_lm_heads[ch](hs1[:, ch + 1])
-        approx_tokens.append(int(_sample_audio(ch_logits, do_sample).item()))
-
-    # ---------- pass 2: fill with approximate token embeddings ----------
-    seq2 = torch.zeros(1, n_vq + 1, emb_dim, dtype=ldtype, device=device)
-    seq2[:, 0] = g_h.squeeze(1)
-    seq2[:, 1] = model.transformer.wte(
-        torch.tensor([[slot_id]], device=device)
-    ).to(ldtype).squeeze(1)
-    for ch, tok in enumerate(approx_tokens[: eff_nq - 1]):
-        seq2[:, ch + 2] = model.audio_embeddings[ch](
-            torch.tensor([[tok]], device=device)
-        ).to(ldtype).squeeze(1)
-
-    out2 = model.local_transformer(inputs_embeds=seq2, use_cache=False, return_dict=True)
-    hs2 = out2.last_hidden_state
-
-    # final tokens from pass-2 (corrected logits)
-    frame: list[int] = []
-    for ch in range(eff_nq):
-        ch_logits = model.audio_lm_heads[ch](hs2[:, ch + 1])
-        frame.append(int(_sample_audio(ch_logits, do_sample).item()))
-
-    return True, frame
 
 
 @torch.inference_mode()
@@ -647,12 +468,11 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
             torch.cuda.manual_seed_all(args.seed)
 
     t_load_start = time.perf_counter()
-    if args.dtype in QUANT_MODES:
-        model = _load_quantized_model(args.checkpoint, device, args.dtype)
-    else:
-        dtype = resolve_dtype(args.dtype, device)
-        model = AutoModelForCausalLM.from_pretrained(args.checkpoint, trust_remote_code=True)
-        model.to(device=device, dtype=dtype)
+
+    # Load model and move to device before loading codec, so that the model load time includes any CUDA kernel compilation and memory allocation overhead, but the codec load time does not (since the codec is not used during TTFT).
+    dtype = resolve_dtype(args.dtype, device)
+    model = AutoModelForCausalLM.from_pretrained(args.checkpoint, trust_remote_code=True)
+    model.to(device=device, dtype=dtype)
     if hasattr(model, "_set_attention_implementation"):
         model._set_attention_implementation("sdpa" if device.type == "cuda" else "eager")
     model.eval()
@@ -666,9 +486,6 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
         device=device,
     )
     _cuda_sync(device)
-
-    if args.compile:
-        _apply_compile(model, device)
 
     if args.warmup:
         _run_warmup(model, device, codec, nq=args.nq)
