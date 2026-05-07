@@ -8,6 +8,12 @@ from dataclasses import dataclass
 
 from tts_robust_normalizer_single_script import normalize_tts_text
 
+try:
+    import tn  # noqa: F401 — probe only; lazy imports live inside _ensure_normalizers_loaded
+    _WETEXT_AVAILABLE = True
+except ImportError:
+    _WETEXT_AVAILABLE = False
+
 ENGLISH_VOICES = frozenset({"Trump", "Ava", "Bella", "Adam", "Nathan"})
 CUSTOM_ZH_WETEXT_CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "wetext_zh_no_erhua_keep_punct"
 _ZH_WETEXT_KEEP_HYPHEN = "___KEEP_HYPHEN_BEFORE_ZH_WETEXT___"
@@ -35,7 +41,7 @@ class WeTextProcessingManager:
         self._state = "pending"
         self._message = "Waiting for WeTextProcessing preload."
         self._error: str | None = None
-        self._available = True
+        self._available = _WETEXT_AVAILABLE
         self._normalizers: dict[str, object] | None = None
 
     def snapshot(self) -> TextNormalizationSnapshot:

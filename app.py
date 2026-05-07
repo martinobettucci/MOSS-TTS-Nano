@@ -226,7 +226,13 @@ class WarmupManager:
                 )
                 normalization_snapshot = self.text_normalizer_manager.ensure_ready()
                 if normalization_snapshot.failed:
-                    raise RuntimeError(normalization_snapshot.error or normalization_snapshot.message)
+                    if not normalization_snapshot.available:
+                        logging.warning(
+                            "WeTextProcessing is not installed; disabling text normalization for app server."
+                        )
+                        self.text_normalizer_manager = None
+                    else:
+                        raise RuntimeError(normalization_snapshot.error or normalization_snapshot.message)
             self._set_state(
                 state="ready",
                 progress=1.0,

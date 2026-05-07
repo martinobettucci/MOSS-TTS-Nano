@@ -320,8 +320,16 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
         text_normalizer_manager = WeTextProcessingManager()
         snapshot = text_normalizer_manager.ensure_ready()
         if not snapshot.ready:
-            raise RuntimeError(snapshot.error or snapshot.message)
-        logging.info("WeTextProcessing ready for infer.py status=%s", snapshot.message)
+            if not snapshot.available:
+                logging.warning(
+                    "WeTextProcessing is not installed; falling back to robust text normalizer only."
+                )
+                enable_wetext_processing = False
+                text_normalizer_manager = None
+            else:
+                raise RuntimeError(snapshot.error or snapshot.message)
+        else:
+            logging.info("WeTextProcessing ready for infer.py status=%s", snapshot.message)
     prepared_texts = prepare_tts_request_texts(
         text=raw_text,
         prompt_text=raw_prompt_text,

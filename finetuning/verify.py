@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -89,14 +90,18 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
 
+    t_load_start = time.perf_counter()
     model = AutoModelForCausalLM.from_pretrained(args.checkpoint, trust_remote_code=True)
     model.to(device=device, dtype=dtype)
     if hasattr(model, "_set_attention_implementation"):
         model._set_attention_implementation("sdpa" if device.type == "cuda" else "eager")
     model.eval()
+    t_load_end = time.perf_counter()
+    print(f"[PERF] model_load_s={t_load_end - t_load_start:.3f}", flush=True)
 
     text = resolve_text(args)
     prompt_text = resolve_prompt_text(args)
+    t_gen_start = time.perf_counter()
     result = model.inference(
         text=text,
         output_audio_path=args.output_audio_path,
@@ -113,9 +118,14 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
         do_sample=bool(args.do_sample),
         use_kv_cache=True,
     )
+    t_gen_end = time.perf_counter()
+    frames = int(result['audio_token_ids'].shape[0])
+    print(f"[PERF] generate_s={t_gen_end - t_gen_start:.3f}", flush=True)
+    print(f"[PERF] audio_token_frames={frames}", flush=True)
+    print(f"[PERF] sample_rate={result['sample_rate']}", flush=True)
     print(
         f"saved {result['audio_path']} sample_rate={result['sample_rate']} "
-        f"frames={int(result['audio_token_ids'].shape[0])}"
+        f"frames={frames}"
     )
     return result
 
