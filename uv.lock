@@ -345,6 +345,7 @@ dependencies = [
     { name = "torch" },
     { name = "torchaudio" },
     { name = "transformers" },
+    { name = "uvicorn" },
 ]
 
 [package.optional-dependencies]
@@ -363,6 +364,7 @@ requires-dist = [
     { name = "torch", specifier = "==2.11.0+cu130" },
     { name = "torchaudio", specifier = "==2.11.0+cu130" },
     { name = "transformers", specifier = "==4.57.6" },
+    { name = "uvicorn", specifier = ">=0.46.0" },
     { name = "uvicorn", marker = "extra == 'api'", specifier = ">=0.29.0" },
 ]
 provides-extras = ["api"]
