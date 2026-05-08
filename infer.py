@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 import logging
+import time
 from pathlib import Path
 from typing import Optional, Sequence
 
+import numpy as np
 import torch
 from transformers import AutoModelForCausalLM
 
+from checkpoint_resolver import add_checkpoint_args, resolve_pytorch_checkpoint
 from moss_tts_nano.defaults import (
     DEFAULT_AUDIO_TOKENIZER_PATH,
     DEFAULT_CHECKPOINT_PATH,
@@ -40,7 +43,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         default=str(DEFAULT_CHECKPOINT_PATH),
-        help="Checkpoint directory loadable by from_pretrained().",
+        help=(
+            "Without --lang: HF repo-id or local path. "
+            "With --lang: 0 = base model, N = checkpoint-epoch-N, last = checkpoint-last."
+        ),
+    )
+    parser.add_argument(
+        "--lang",
+        default=None,
+        help="Language code of a finetuned checkpoint (e.g. fr). Activates finetuned checkpoint resolution.",
     )
     parser.add_argument(
         "--output-audio-path",
@@ -173,6 +184,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--repetition-penalty", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--seed", type=int, default=None, help="Optional random seed for sampling.")
+    parser.add_argument("--eval-wer", action="store_true", help="Compute WER via Whisper ASR after generation (slow, requires jiwer).")
+    parser.add_argument("--eval-mos", action="store_true", help="Compute UTMOS (real MOS estimate) after generation (slow, requires speechmos).")
 
     parser.add_argument("--debug_ip", type=str, default="localhost")
     parser.add_argument("--debug_port", type=int, default=32431)
@@ -214,7 +227,12 @@ def resolve_dtype(dtype_arg: str, device: torch.device) -> torch.dtype:
     return torch.float32
 
 
-def load_model(checkpoint: str, device: torch.device, dtype: torch.dtype):
+def load_model(
+    checkpoint: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    audio_tokenizer_pretrained_name_or_path: str = DEFAULT_AUDIO_TOKENIZER_PRETRAINED_NAME_OR_PATH,
+):
     model = AutoModelForCausalLM.from_pretrained(
         checkpoint,
         trust_remote_code=True,
@@ -222,7 +240,88 @@ def load_model(checkpoint: str, device: torch.device, dtype: torch.dtype):
     model.to(device=device, dtype=dtype)
     model._set_attention_implementation("sdpa")
     model.eval()
-    return model
+    codec = model._load_audio_tokenizer(
+        audio_tokenizer_type=MOSS_AUDIO_TOKENIZER_TYPE,
+        audio_tokenizer_pretrained_name_or_path=audio_tokenizer_pretrained_name_or_path,
+        device=device,
+    )
+    return model, codec
+
+
+def _mos_proxy(wav: np.ndarray) -> float:
+    frame_len = 480
+    frames = [wav[i: i + frame_len] for i in range(0, len(wav) - frame_len, frame_len)]
+    if not frames:
+        return 1.0
+    energies = np.array([np.mean(f ** 2) for f in frames])
+    threshold = float(np.percentile(energies, 20))
+    speech_e = energies[energies > threshold]
+    noise_e = energies[energies <= threshold]
+    if len(noise_e) == 0 or float(noise_e.mean()) <= 0:
+        return 3.5
+    snr = 10.0 * np.log10(float(speech_e.mean()) / (float(noise_e.mean()) + 1e-9))
+    return float(np.clip(1.0 + (snr / 40.0) * 4.0, 1.0, 5.0))
+
+
+def _eval_wer(audio_path: str, reference_text: str, device: torch.device) -> float:
+    try:
+        import warnings
+        from transformers import pipeline as hf_pipeline
+        from jiwer import wer as compute_wer
+        logging.info("[metrics] Running Whisper ASR for WER...")
+        dev_id = 0 if device.type == "cuda" else -1
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            asr = hf_pipeline("automatic-speech-recognition", model="openai/whisper-base", device=dev_id)
+            out = asr(audio_path, generate_kwargs={"task": "transcribe"})
+        hyp = (out.get("text") or "").strip().lower()
+        ref = reference_text.strip().lower()
+        return float(min(1.0, compute_wer([ref], [hyp])))
+    except ImportError:
+        logging.warning("[metrics] jiwer or transformers not installed; WER skipped.")
+        return -1.0
+    except Exception as exc:
+        logging.warning("[metrics] WER computation failed: %s", exc)
+        return -1.0
+
+
+def _eval_utmos(wav: np.ndarray, sample_rate: int) -> float:
+    try:
+        import speechmos
+        return float(speechmos.utmos(wav, sr=sample_rate))
+    except ImportError:
+        logging.warning("[metrics] speechmos not installed; using MOS proxy instead.")
+        return _mos_proxy(wav)
+    except Exception as exc:
+        logging.warning("[metrics] UTMOS computation failed: %s", exc)
+        return _mos_proxy(wav)
+
+
+def _print_metrics(
+    *,
+    generation_time_sec: float,
+    audio_duration_sec: float,
+    rtf: float,
+    ttft_sec: float | None,
+    mos_proxy: float,
+    mos_utmos: float | None,
+    wer: float | None,
+) -> None:
+    sep = "─" * 46
+    lines = [
+        f"[METRICS] {sep}",
+        f"  Generation time : {generation_time_sec:.3f}s",
+        f"  Audio duration  : {audio_duration_sec:.3f}s",
+        f"  RTF             : {rtf:.3f}" + (" ✓" if 0 < rtf < 0.5 else (" ✗" if rtf >= 0 else " (n/a)")),
+        f"  First audio     : {ttft_sec:.3f}s" if ttft_sec is not None else "  First audio     : n/a",
+        f"  MOS (proxy/SNR) : {mos_proxy:.2f}/5.0" + (" ✓" if mos_proxy > 3.0 else (" ✗" if mos_proxy > 0 else " (n/a)")),
+    ]
+    if mos_utmos is not None and mos_utmos >= 0:
+        lines.append(f"  MOS (UTMOS)     : {mos_utmos:.2f}/5.0" + (" ✓" if mos_utmos > 3.0 else " ✗"))
+    if wer is not None and wer >= 0:
+        lines.append(f"  WER             : {wer:.1%}" + (" ✓" if wer < 0.1 else " ✗"))
+    lines.append(f"[METRICS] {sep}")
+    print("\n".join(lines), flush=True)
 
 
 def resolve_sampling_kwargs(args: argparse.Namespace) -> dict[str, object]:
@@ -300,6 +399,11 @@ def maybe_print_voice_clone_text_chunks(
 def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
     set_logging()
     args = parse_args(argv)
+    args.checkpoint = resolve_pytorch_checkpoint(
+        args.lang,
+        args.checkpoint,
+        default_checkpoint=str(DEFAULT_CHECKPOINT_PATH),
+    )
     if args.debug == 1:
         waiting_for_debug(args.debug_ip, args.debug_port)
     device = resolve_device(args.device)
@@ -309,7 +413,12 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
 
-    model = load_model(args.checkpoint, device=device, dtype=dtype)
+    model, codec = load_model(
+        args.checkpoint,
+        device=device,
+        dtype=dtype,
+        audio_tokenizer_pretrained_name_or_path=args.audio_tokenizer_pretrained_name_or_path,
+    )
     sampling_kwargs = resolve_sampling_kwargs(args)
     raw_text = resolve_text(args)
     raw_prompt_text = resolve_prompt_text(args) or ""
@@ -349,16 +458,20 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
     )
     maybe_print_voice_clone_text_chunks(model=model, args=args, text=text)
     logging.info("running inference mode=%s", args.mode)
-    result = model.inference(
+
+    t_gen_start = time.perf_counter()
+    t_first_audio: float | None = None
+    result: dict | None = None
+
+    for event in model.inference_stream(
         text=text,
         output_audio_path=args.output_audio_path,
         mode=args.mode,
         prompt_text=prompt_text,
         prompt_audio_path=args.prompt_audio_path,
         reference_audio_path=args.reference_audio_path,
-        text_tokenizer_path=args.text_tokenizer_path,
-        audio_tokenizer_type=MOSS_AUDIO_TOKENIZER_TYPE,
-        audio_tokenizer_pretrained_name_or_path=args.audio_tokenizer_pretrained_name_or_path,
+        text_tokenizer_path=args.text_tokenizer_path or args.checkpoint,
+        audio_tokenizer=codec,
         device=device,
         nq=args.nq,
         max_new_frames=args.max_new_frames,
@@ -367,11 +480,51 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
         do_sample=bool(args.do_sample),
         use_kv_cache=True,
         **sampling_kwargs,
+    ):
+        if event.get("type") == "audio" and t_first_audio is None:
+            t_first_audio = time.perf_counter()
+        elif event.get("type") == "result":
+            result = event
+
+    if result is None:
+        raise RuntimeError("inference_stream produced no result event")
+
+    t_gen_end = time.perf_counter()
+    generation_time_sec = t_gen_end - t_gen_start
+    ttft_sec = (t_first_audio - t_gen_start) if t_first_audio is not None else None
+
+    sample_rate = int(result["sample_rate"])
+    waveform = result.get("waveform")
+    if waveform is not None:
+        wav_np = torch.as_tensor(waveform, dtype=torch.float32).detach().cpu().numpy()
+        if wav_np.ndim > 1:
+            wav_np = wav_np[0] if wav_np.shape[0] <= 8 else wav_np.T[:, 0]
+        audio_duration_sec = float(wav_np.shape[0]) / sample_rate
+        mos_proxy = _mos_proxy(wav_np)
+    else:
+        wav_np = None
+        audio_duration_sec = float(result["audio_token_ids"].shape[0]) / 25.0
+        mos_proxy = -1.0
+
+    rtf = generation_time_sec / audio_duration_sec if audio_duration_sec > 0 else -1.0
+
+    wer = _eval_wer(str(result["audio_path"]), text, device) if args.eval_wer else None
+    mos_utmos = _eval_utmos(wav_np, sample_rate) if (args.eval_mos and wav_np is not None) else None
+
+    _print_metrics(
+        generation_time_sec=generation_time_sec,
+        audio_duration_sec=audio_duration_sec,
+        rtf=rtf,
+        ttft_sec=ttft_sec,
+        mos_proxy=mos_proxy,
+        mos_utmos=mos_utmos,
+        wer=wer,
     )
+
     logging.info(
         "saved generated audio to %s sample_rate=%s frames=%s",
         result["audio_path"],
-        result["sample_rate"],
+        sample_rate,
         int(result["audio_token_ids"].shape[0]),
     )
     return result

@@ -23,6 +23,7 @@ import uvicorn
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
+from checkpoint_resolver import add_checkpoint_args, resolve_pytorch_checkpoint
 from moss_tts_nano_runtime import (
     DEFAULT_AUDIO_TOKENIZER_PATH,
     DEFAULT_CHECKPOINT_PATH,
@@ -380,6 +381,8 @@ class StreamingJob:
     audio_chunk_ranges: list[tuple[float, float, int]] = field(default_factory=list)
     is_closed: bool = False
     final_result: dict[str, object] | None = None
+    rtf: float = -1.0
+    mos_proxy: float = -1.0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def _resolve_playback_chunk_index_locked(self) -> int | None:
@@ -416,6 +419,8 @@ class StreamingJob:
                 "ready": self.state == "done",
                 "failed": self.state == "failed",
                 "closed": self.is_closed,
+                "rtf": self.rtf,
+                "mos_proxy": self.mos_proxy,
             }
 
 
@@ -602,6 +607,76 @@ def _maybe_delete_file(path_value: str | None) -> None:
         Path(path_value).unlink(missing_ok=True)
     except Exception:
         logging.warning("failed to remove temporary file: %s", path_value, exc_info=True)
+
+
+def _mos_proxy_app(wav: np.ndarray) -> float:
+    wav = np.asarray(wav, dtype=np.float32).flatten()
+    frame_len = 480
+    frames = [wav[i: i + frame_len] for i in range(0, len(wav) - frame_len, frame_len)]
+    if not frames:
+        return 1.0
+    energies = np.array([np.mean(f ** 2) for f in frames])
+    threshold = float(np.percentile(energies, 20))
+    speech_e = energies[energies > threshold]
+    noise_e = energies[energies <= threshold]
+    if len(noise_e) == 0 or float(noise_e.mean()) <= 0:
+        return 3.5
+    snr = 10.0 * np.log10(float(speech_e.mean()) / (float(noise_e.mean()) + 1e-9))
+    return float(np.clip(1.0 + (snr / 40.0) * 4.0, 1.0, 5.0))
+
+
+def _eval_wer_app(audio_path: str, reference_text: str, device_str: str) -> float:
+    try:
+        import warnings
+        from transformers import pipeline as hf_pipeline
+        from jiwer import wer as compute_wer
+        dev_id = 0 if "cuda" in device_str else -1
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            asr = hf_pipeline("automatic-speech-recognition", model="openai/whisper-base", device=dev_id)
+            out = asr(audio_path, generate_kwargs={"task": "transcribe"})
+        hyp = (out.get("text") or "").strip().lower()
+        ref = reference_text.strip().lower()
+        return float(min(1.0, compute_wer([ref], [hyp])))
+    except ImportError:
+        logging.warning("[metrics] jiwer or transformers not installed; WER skipped.")
+        return -1.0
+    except Exception as exc:
+        logging.warning("[metrics] WER computation failed: %s", exc)
+        return -1.0
+
+
+def _eval_utmos_app(wav: np.ndarray, sample_rate: int) -> float:
+    try:
+        import speechmos
+        return float(speechmos.utmos(wav.flatten().astype(np.float32), sr=sample_rate))
+    except ImportError:
+        return _mos_proxy_app(wav)
+    except Exception as exc:
+        logging.warning("[metrics] UTMOS computation failed: %s", exc)
+        return _mos_proxy_app(wav)
+
+
+def _format_blocking_metrics_text(
+    *,
+    generation_time_sec: float,
+    audio_duration_sec: float,
+    rtf: float,
+    mos_proxy: float,
+    mos_utmos: float,
+    wer: float,
+) -> str:
+    parts = [
+        f"gen={generation_time_sec:.2f}s",
+        f"audio={audio_duration_sec:.2f}s",
+        f"RTF={rtf:.3f}" + (" ✓" if 0 < rtf < 0.5 else (" ✗" if rtf >= 0 else "")),
+        f"MOS~{mos_proxy:.2f}" + (" ✓" if mos_proxy > 3.0 else (" ✗" if mos_proxy > 0 else "")),
+    ]
+    if mos_utmos >= 0:
+        parts.append(f"UTMOS={mos_utmos:.2f}" + (" ✓" if mos_utmos > 3.0 else " ✗"))
+    if wer >= 0:
+        parts.append(f"WER={wer:.1%}" + (" ✓" if wer < 0.1 else " ✗"))
+    return " | ".join(parts)
 
 
 def _coerce_bool(value: str | None, default: bool) -> bool:
@@ -1191,6 +1266,14 @@ def _render_index_html(
           </div>
           <div class="row">
             <div class="field">
+              <label><input id="eval-wer" type="checkbox"> Compute WER <span class="meta">(slow, needs jiwer)</span></label>
+            </div>
+            <div class="field">
+              <label><input id="eval-mos" type="checkbox"> Compute UTMOS <span class="meta">(slow, needs speechmos)</span></label>
+            </div>
+          </div>
+          <div class="row">
+            <div class="field">
               <label><input id="realtime-stream" type="checkbox" checked> Realtime Streaming Decode</label>
             </div>
             <div class="field">
@@ -1715,6 +1798,8 @@ def _render_index_html(
       formData.append("enable_text_normalization", document.getElementById("enable-text-normalization").checked ? "1" : "0");
       formData.append("enable_normalize_tts_text", document.getElementById("enable-robust-text-normalization").checked ? "1" : "0");
       formData.append("cpu_threads", document.getElementById("cpu-thread-count").value || String(DEFAULT_CPU_THREADS));
+      formData.append("eval_wer", document.getElementById("eval-wer").checked ? "1" : "0");
+      formData.append("eval_mos", document.getElementById("eval-mos").checked ? "1" : "0");
       return formData;
     }
 
@@ -1889,6 +1974,9 @@ def _render_index_html(
       updatePauseButtonState();
       resolvedPrompt.textContent = "Generated speech is ready.";
       setStatus(runStatus, data.run_status || "Done.");
+      if (data.metrics_text) {
+        streamMetrics.textContent = data.metrics_text;
+      }
       if (data.warmup_status_text) {
         setStatus(warmupStatus, data.warmup_status_text);
       }
@@ -2258,7 +2346,15 @@ def _build_app(
         ]
         first_audio_latency = snapshot.get("first_audio_latency_seconds")
         if first_audio_latency is not None:
-            metrics.append(f"first_audio={float(first_audio_latency):.2f}s")
+            metrics.append(f"first_audio={float(first_audio_latency):.3f}s")
+        rtf = snapshot.get("rtf", -1.0)
+        if rtf is not None and float(rtf) >= 0:
+            rtf_v = float(rtf)
+            metrics.append(f"RTF={rtf_v:.3f}" + (" ✓" if rtf_v < 0.5 else " ✗"))
+        mos = snapshot.get("mos_proxy", -1.0)
+        if mos is not None and float(mos) > 0:
+            mos_v = float(mos)
+            metrics.append(f"MOS~{mos_v:.2f}" + (" ✓" if mos_v > 3.0 else " ✗"))
         return " | ".join(metrics)
 
     def _text_normalization_status_text(snapshot: SharedTextNormalizationSnapshot | None) -> str:
@@ -2395,7 +2491,15 @@ def _build_app(
                     if resolved_cpu_threads is not None:
                         formatted_result["cpu_threads"] = resolved_cpu_threads
                     formatted_run_status = _format_run_status(formatted_result)
+                    _wf = np.asarray(event.get("waveform_numpy", []), dtype=np.float32)
+                    _sr = int(event.get("sample_rate", 48000))
+                    _elapsed = float(event.get("elapsed_seconds", 0.0))
+                    _audio_dur = float(_wf.shape[0]) / _sr if _wf.ndim >= 1 and _sr > 0 and _wf.size > 0 else 0.0
+                    _computed_rtf = _elapsed / _audio_dur if _audio_dur > 0 else -1.0
+                    _computed_mos = _mos_proxy_app(_wf) if _wf.size > 0 else -1.0
                     with job.lock:
+                        job.rtf = _computed_rtf
+                        job.mos_proxy = _computed_mos
                         job.final_result = {
                             "audio_path": event.get("audio_path"),
                             "prompt_audio_path": prompt_audio_display_path,
@@ -2737,6 +2841,8 @@ def _build_app(
         audio_top_k: int = Form(25),
         audio_repetition_penalty: float = Form(1.2),
         seed: str = Form("0"),
+        eval_wer: str = Form("0"),
+        eval_mos: str = Form("0"),
     ):
         try:
             demo_entry, prompt_audio_path, prompt_audio_display_path, prompt_audio_cleanup_path = (
@@ -2818,9 +2924,25 @@ def _build_app(
                 )
             generated_audio_path = str(result["audio_path"])
             wav_bytes = _audio_to_wav_bytes(result["waveform_numpy"], int(result["sample_rate"]))
+            _wf_np = np.asarray(result["waveform_numpy"], dtype=np.float32)
+            _sr_v = int(result["sample_rate"])
+            _elapsed_v = float(result["elapsed_seconds"])
+            _audio_dur_v = float(_wf_np.shape[0]) / _sr_v if _wf_np.ndim >= 1 and _sr_v > 0 and _wf_np.size > 0 else 0.0
+            _rtf_v = _elapsed_v / _audio_dur_v if _audio_dur_v > 0 else -1.0
+            _mos_proxy_v = _mos_proxy_app(_wf_np) if _wf_np.size > 0 else -1.0
+            _wer_v = _eval_wer_app(generated_audio_path, str(prepared_texts["text"]), str(runtime.device)) if _coerce_bool(eval_wer, False) else -1.0
+            _mos_utmos_v = _eval_utmos_app(_wf_np, _sr_v) if _coerce_bool(eval_mos, False) else -1.0
+            _metrics_text = _format_blocking_metrics_text(
+                generation_time_sec=_elapsed_v,
+                audio_duration_sec=_audio_dur_v,
+                rtf=_rtf_v,
+                mos_proxy=_mos_proxy_v,
+                mos_utmos=_mos_utmos_v,
+                wer=_wer_v,
+            )
             return {
                 "audio_base64": base64.b64encode(wav_bytes).decode("ascii"),
-                "sample_rate": int(result["sample_rate"]),
+                "sample_rate": _sr_v,
                 "run_status": _format_run_status(result),
                 "prompt_audio_path": prompt_audio_display_path,
                 "warmup_status_text": _warmup_status_text(warmup_manager.snapshot()),
@@ -2831,6 +2953,15 @@ def _build_app(
                 "normalized_text": str(prepared_texts["normalized_text"]),
                 "normalization_method": str(prepared_texts["normalization_method"]),
                 "text_normalization_language": str(prepared_texts["text_normalization_language"]),
+                "metrics_text": _metrics_text,
+                "metrics": {
+                    "generation_time_sec": _elapsed_v,
+                    "audio_duration_sec": _audio_dur_v,
+                    "rtf": _rtf_v,
+                    "mos_proxy": _mos_proxy_v,
+                    "mos_utmos": _mos_utmos_v,
+                    "wer": _wer_v,
+                },
             }
         except Exception as exc:
             logging.exception("Nano-TTS generation failed")
@@ -2845,6 +2976,7 @@ def _build_app(
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="MOSS-TTS-Nano web demo")
     parser.add_argument("--checkpoint-path", "--checkpoint_path", dest="checkpoint_path", type=str, default=str(DEFAULT_CHECKPOINT_PATH))
+    add_checkpoint_args(parser)
     parser.add_argument(
         "--audio-tokenizer-path",
         "--audio_tokenizer_path",
@@ -2871,6 +3003,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         level=logging.INFO,
+    )
+
+    args.checkpoint_path = resolve_pytorch_checkpoint(
+        args.lang,
+        args.checkpoint,
+        default_checkpoint=args.checkpoint_path,
     )
 
     resolved_runtime_device = "cpu"

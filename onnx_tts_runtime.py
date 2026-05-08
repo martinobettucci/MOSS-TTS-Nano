@@ -541,6 +541,7 @@ class OnnxTtsRuntime(OrtCpuRuntime):
                 "text_token_ids": text_token_ids,
                 "generated_frames": generated_frames,
                 "waveform": waveform,
+                "first_audio_at_perf": None,
             }
 
         pending_decode_frames: list[list[int]] = []
@@ -591,6 +592,7 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             "text_token_ids": text_token_ids,
             "generated_frames": generated_frames,
             "waveform": waveform,
+            "first_audio_at_perf": first_audio_emitted_at_perf,
         }
 
     def synthesize(
@@ -651,6 +653,7 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             else (self.output_dir / DEFAULT_BROWSER_ONNX_OUTPUT_PATH.name).resolve()
         )
         audio_path = _write_waveform_to_wav(resolved_output_audio_path, waveform, sample_rate)
+        first_audio_at_perf = chunk_results[0].get("first_audio_at_perf") if chunk_results else None
         return {
             "audio_path": str(audio_path),
             "waveform": waveform,
@@ -662,4 +665,5 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             "do_sample": normalized_sample_mode != SAMPLE_MODE_GREEDY,
             "streaming": bool(streaming),
             "chunk_results": chunk_results,
+            "first_audio_at_perf": first_audio_at_perf,
         }

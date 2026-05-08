@@ -15,6 +15,7 @@ import numpy as np
 import uvicorn
 
 import app as legacy_app
+from checkpoint_resolver import add_checkpoint_args, resolve_onnx_model_dir
 from onnx_tts_runtime import (
     DEFAULT_BROWSER_ONNX_MODEL_DIR,
     OnnxTtsRuntime,
@@ -606,6 +607,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-new-frames", type=int, default=375)
     parser.add_argument("--share", action="store_true")
+    add_checkpoint_args(parser)
     return parser.parse_args(argv)
 
 
@@ -616,11 +618,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         level=logging.INFO,
     )
 
+    resolved_model_dir = resolve_onnx_model_dir(args.lang, args.checkpoint) or args.model_dir
+
     text_normalizer_manager = WeTextProcessingManager()
     text_normalizer_manager.start()
     output_dir = Path(args.output_dir).expanduser().resolve()
     runtime = OnnxNanoTTSServiceAdapter(
-        model_dir=args.model_dir,
+        model_dir=resolved_model_dir,
         output_dir=output_dir,
         cpu_threads=args.cpu_threads,
         execution_provider=args.execution_provider,

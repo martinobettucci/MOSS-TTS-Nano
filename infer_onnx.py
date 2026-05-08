@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import time
 from pathlib import Path
 from typing import Optional, Sequence
 
+import numpy as np
+
+from checkpoint_resolver import add_checkpoint_args, resolve_onnx_model_dir
 from onnx_tts_runtime import (
     DEFAULT_BROWSER_ONNX_MODEL_DIR,
     DEFAULT_BROWSER_ONNX_OUTPUT_PATH,
@@ -127,6 +131,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Print the effective chunked text before synthesis.",
     )
+    parser.add_argument("--eval-wer", action="store_true", help="Compute WER via Whisper ASR after generation (slow, requires jiwer).")
+    parser.add_argument("--eval-mos", action="store_true", help="Compute UTMOS (real MOS estimate) after generation (slow, requires speechmos).")
+    add_checkpoint_args(parser)
     return parser.parse_args(argv)
 
 
@@ -148,11 +155,89 @@ def maybe_print_voice_clone_text_chunks(runtime: OnnxTtsRuntime, text: str, max_
         print()
 
 
+def _mos_proxy(wav: np.ndarray) -> float:
+    wav = np.asarray(wav, dtype=np.float32).flatten()
+    frame_len = 480
+    frames = [wav[i: i + frame_len] for i in range(0, len(wav) - frame_len, frame_len)]
+    if not frames:
+        return 1.0
+    energies = np.array([np.mean(f ** 2) for f in frames])
+    threshold = float(np.percentile(energies, 20))
+    speech_e = energies[energies > threshold]
+    noise_e = energies[energies <= threshold]
+    if len(noise_e) == 0 or float(noise_e.mean()) <= 0:
+        return 3.5
+    snr = 10.0 * np.log10(float(speech_e.mean()) / (float(noise_e.mean()) + 1e-9))
+    return float(np.clip(1.0 + (snr / 40.0) * 4.0, 1.0, 5.0))
+
+
+def _eval_wer(audio_path: str, reference_text: str, execution_provider: str) -> float:
+    try:
+        import warnings
+        from transformers import pipeline as hf_pipeline
+        from jiwer import wer as compute_wer
+        logging.info("[metrics] Running Whisper ASR for WER...")
+        dev_id = 0 if execution_provider == "cuda" else -1
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            asr = hf_pipeline("automatic-speech-recognition", model="openai/whisper-base", device=dev_id)
+            out = asr(audio_path, generate_kwargs={"task": "transcribe"})
+        hyp = (out.get("text") or "").strip().lower()
+        ref = reference_text.strip().lower()
+        return float(min(1.0, compute_wer([ref], [hyp])))
+    except ImportError:
+        logging.warning("[metrics] jiwer or transformers not installed; WER skipped.")
+        return -1.0
+    except Exception as exc:
+        logging.warning("[metrics] WER computation failed: %s", exc)
+        return -1.0
+
+
+def _eval_utmos(wav: np.ndarray, sample_rate: int) -> float:
+    try:
+        import speechmos
+        return float(speechmos.utmos(wav.flatten().astype(np.float32), sr=sample_rate))
+    except ImportError:
+        logging.warning("[metrics] speechmos not installed; using MOS proxy instead.")
+        return _mos_proxy(wav)
+    except Exception as exc:
+        logging.warning("[metrics] UTMOS computation failed: %s", exc)
+        return _mos_proxy(wav)
+
+
+def _print_metrics(
+    *,
+    generation_time_sec: float,
+    audio_duration_sec: float,
+    rtf: float,
+    ttft_sec: float | None,
+    mos_proxy: float,
+    mos_utmos: float | None,
+    wer: float | None,
+) -> None:
+    sep = "─" * 46
+    lines = [
+        f"[METRICS] {sep}",
+        f"  Generation time : {generation_time_sec:.3f}s",
+        f"  Audio duration  : {audio_duration_sec:.3f}s",
+        f"  RTF             : {rtf:.3f}" + (" ✓" if 0 < rtf < 0.5 else (" ✗" if rtf >= 0 else " (n/a)")),
+        f"  First audio     : {ttft_sec:.3f}s" if ttft_sec is not None else "  First audio     : n/a (non-streaming mode)",
+        f"  MOS (proxy/SNR) : {mos_proxy:.2f}/5.0" + (" ✓" if mos_proxy > 3.0 else (" ✗" if mos_proxy > 0 else " (n/a)")),
+    ]
+    if mos_utmos is not None and mos_utmos >= 0:
+        lines.append(f"  MOS (UTMOS)     : {mos_utmos:.2f}/5.0" + (" ✓" if mos_utmos > 3.0 else " ✗"))
+    if wer is not None and wer >= 0:
+        lines.append(f"  WER             : {wer:.1%}" + (" ✓" if wer < 0.1 else " ✗"))
+    lines.append(f"[METRICS] {sep}")
+    print("\n".join(lines), flush=True)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
     set_logging()
     args = parse_args(argv)
+    resolved_model_dir = resolve_onnx_model_dir(args.lang, args.checkpoint) or args.model_dir
     runtime = OnnxTtsRuntime(
-        model_dir=args.model_dir,
+        model_dir=resolved_model_dir,
         thread_count=args.cpu_threads,
         max_new_frames=args.max_new_frames,
         do_sample=bool(args.do_sample),
@@ -189,6 +274,7 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
         logging.info("using direct reference audio path for voice cloning: %s", args.prompt_audio_path)
     else:
         logging.info("using built-in voice preset: %s", args.voice)
+    t_gen_start = time.perf_counter()
     result = runtime.synthesize(
         text=raw_text,
         voice=args.voice,
@@ -203,10 +289,36 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
         enable_normalize_tts_text=enable_normalize_tts_text,
         seed=args.seed,
     )
+    t_gen_end = time.perf_counter()
+    generation_time_sec = t_gen_end - t_gen_start
+
+    sample_rate = int(result["sample_rate"])
+    waveform = np.asarray(result["waveform"], dtype=np.float32)
+    wav_1d = waveform.flatten() if waveform.ndim > 1 else waveform
+    audio_duration_sec = float(wav_1d.shape[0]) / sample_rate if sample_rate > 0 and wav_1d.size > 0 else 0.0
+    rtf = generation_time_sec / audio_duration_sec if audio_duration_sec > 0 else -1.0
+    mos_proxy = _mos_proxy(wav_1d) if wav_1d.size > 0 else -1.0
+
+    first_audio_at = result.get("first_audio_at_perf")
+    ttft_sec = (first_audio_at - t_gen_start) if first_audio_at is not None else None
+
+    wer = _eval_wer(str(result["audio_path"]), raw_text, args.execution_provider) if args.eval_wer else None
+    mos_utmos = _eval_utmos(wav_1d, sample_rate) if args.eval_mos else None
+
+    _print_metrics(
+        generation_time_sec=generation_time_sec,
+        audio_duration_sec=audio_duration_sec,
+        rtf=rtf,
+        ttft_sec=ttft_sec,
+        mos_proxy=mos_proxy,
+        mos_utmos=mos_utmos,
+        wer=wer,
+    )
+
     logging.info(
         "saved generated audio to %s sample_rate=%s frames=%s sample_mode=%s streaming=%s execution_provider=%s",
         result["audio_path"],
-        result["sample_rate"],
+        sample_rate,
         int(result["audio_token_ids"].shape[0]),
         result["sample_mode"],
         result["streaming"],
