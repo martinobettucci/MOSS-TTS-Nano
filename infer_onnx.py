@@ -85,6 +85,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="onnxruntime execution provider. cuda requires an onnxruntime-gpu build.",
     )
     parser.add_argument("--max-new-frames", type=int, default=375, help="Maximum generated audio frames.")
+    parser.add_argument(
+        "--nq",
+        type=int,
+        default=None,
+        help=(
+            "Requested VQ channel count. Current ONNX codec exports require the full "
+            "16-channel input; lower values are rejected instead of producing invalid audio."
+        ),
+    )
     parser.add_argument("--voice-clone-max-text-tokens", type=int, default=75, help="Chunk long text by token budget.")
     parser.add_argument("--text-temperature", type=float, default=1.0, help="Text-layer sampling temperature.")
     parser.add_argument("--text-top-p", type=float, default=1.0, help="Text-layer top-p sampling.")
@@ -126,6 +135,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Disable normalize_tts_text robust cleanup before inference.",
     )
     parser.add_argument("--seed", type=int, default=None, help="Optional random seed.")
+    parser.add_argument(
+        "--wer-language",
+        default=None,
+        help=(
+            "Language hint for Whisper WER, e.g. en or fr. "
+            "Defaults to --lang when evaluating a finetuned checkpoint; omit for Whisper auto-detect."
+        ),
+    )
     parser.add_argument(
         "--print-voice-clone-text-chunks",
         action="store_true",
@@ -171,19 +188,54 @@ def _mos_proxy(wav: np.ndarray) -> float:
     return float(np.clip(1.0 + (snr / 40.0) * 4.0, 1.0, 5.0))
 
 
-def _eval_wer(audio_path: str, reference_text: str, execution_provider: str) -> float:
+def _normalize_whisper_language(language: str | None) -> str | None:
+    normalized = str(language or "").strip().lower().replace("_", "-")
+    if not normalized:
+        return None
+    primary = normalized.split("-", 1)[0]
+    language_names = {
+        "en": "english",
+        "fr": "french",
+        "de": "german",
+        "es": "spanish",
+        "it": "italian",
+        "pt": "portuguese",
+        "nl": "dutch",
+        "pl": "polish",
+        "ja": "japanese",
+        "zh": "chinese",
+        "ko": "korean",
+    }
+    return language_names.get(primary, primary)
+
+
+def _eval_wer(
+    audio_path: str,
+    reference_text: str,
+    execution_provider: str,
+    language: str | None = None,
+) -> float:
     try:
         import warnings
         from transformers import pipeline as hf_pipeline
         from jiwer import wer as compute_wer
-        logging.info("[metrics] Running Whisper ASR for WER...")
+        whisper_language = _normalize_whisper_language(language)
+        logging.info(
+            "[metrics] Running Whisper ASR for WER%s...",
+            f" language={whisper_language}" if whisper_language else " with language auto-detect",
+        )
         dev_id = 0 if execution_provider == "cuda" else -1
+        generate_kwargs = {"task": "transcribe"}
+        if whisper_language:
+            generate_kwargs["language"] = whisper_language
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             asr = hf_pipeline("automatic-speech-recognition", model="openai/whisper-base", device=dev_id)
-            out = asr(audio_path, generate_kwargs={"task": "transcribe"})
+            out = asr(audio_path, generate_kwargs=generate_kwargs)
         hyp = (out.get("text") or "").strip().lower()
         ref = reference_text.strip().lower()
+        logging.info("[metrics] Whisper hypothesis: %s", hyp)
+        logging.info("[metrics] WER reference: %s", ref)
         return float(min(1.0, compute_wer([ref], [hyp])))
     except ImportError:
         logging.warning("[metrics] jiwer or transformers not installed; WER skipped.")
@@ -284,6 +336,7 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
         do_sample=bool(args.do_sample),
         streaming=bool(args.realtime_streaming_decode),
         max_new_frames=args.max_new_frames,
+        nq=args.nq,
         voice_clone_max_text_tokens=args.voice_clone_max_text_tokens,
         enable_wetext=enable_wetext,
         enable_normalize_tts_text=enable_normalize_tts_text,
@@ -302,7 +355,17 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
     first_audio_at = result.get("first_audio_at_perf")
     ttft_sec = (first_audio_at - t_gen_start) if first_audio_at is not None else None
 
-    wer = _eval_wer(str(result["audio_path"]), raw_text, args.execution_provider) if args.eval_wer else None
+    wer_language = args.wer_language or args.lang
+    wer = (
+        _eval_wer(
+            str(result["audio_path"]),
+            prepared_text,
+            args.execution_provider,
+            language=wer_language,
+        )
+        if args.eval_wer
+        else None
+    )
     mos_utmos = _eval_utmos(wav_1d, sample_rate) if args.eval_mos else None
 
     _print_metrics(
@@ -316,10 +379,11 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
     )
 
     logging.info(
-        "saved generated audio to %s sample_rate=%s frames=%s sample_mode=%s streaming=%s execution_provider=%s",
+        "saved generated audio to %s sample_rate=%s frames=%s nq=%s sample_mode=%s streaming=%s execution_provider=%s",
         result["audio_path"],
         sample_rate,
         int(result["audio_token_ids"].shape[0]),
+        result.get("nq"),
         result["sample_mode"],
         result["streaming"],
         runtime.execution_provider,

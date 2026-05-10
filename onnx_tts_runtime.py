@@ -606,6 +606,7 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         do_sample: bool = True,
         streaming: bool = False,
         max_new_frames: int | None = None,
+        nq: int | None = None,
         voice_clone_max_text_tokens: int = 75,
         enable_wetext: bool = True,
         enable_normalize_tts_text: bool = True,
@@ -613,6 +614,7 @@ class OnnxTtsRuntime(OrtCpuRuntime):
     ) -> dict[str, Any]:
         if max_new_frames is not None:
             self.manifest["generation_defaults"]["max_new_frames"] = int(max_new_frames)
+        effective_nq = self.set_num_quantizers(nq)
         normalized_sample_mode = _normalize_sample_mode(sample_mode, do_sample)
         self.manifest["generation_defaults"]["sample_mode"] = normalized_sample_mode
         self.manifest["generation_defaults"]["do_sample"] = normalized_sample_mode != SAMPLE_MODE_GREEDY
@@ -664,6 +666,7 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             "sample_mode": normalized_sample_mode,
             "do_sample": normalized_sample_mode != SAMPLE_MODE_GREEDY,
             "streaming": bool(streaming),
+            "nq": effective_nq,
             "chunk_results": chunk_results,
             "first_audio_at_perf": first_audio_at_perf,
         }

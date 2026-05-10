@@ -342,6 +342,7 @@ class OrtCpuRuntime:
         self.codec_meta_path = self.resolve_manifest_relative_path(manifest["model_files"]["codec_meta"])
         self.tts_meta = json.loads(self.tts_meta_path.read_text(encoding="utf-8"))
         self.codec_meta = json.loads(self.codec_meta_path.read_text(encoding="utf-8"))
+        self.effective_nq = int(self.manifest["tts_config"]["n_vq"])
         self.rng = np.random.default_rng(1234)
         self.sessions = self._create_sessions()
         self.codec_streaming_session = CodecStreamingDecodeSession(
@@ -359,6 +360,24 @@ class OrtCpuRuntime:
                 return candidate
         joined = ", ".join(str(path_value) for path_value in tried_paths)
         raise FileNotFoundError(f"browser_poc_manifest.json not found. tried: {joined}")
+
+    def set_num_quantizers(self, nq: int | None) -> int:
+        n_vq = int(self.manifest["tts_config"]["n_vq"])
+        codec_quantizers = int(self.codec_meta["codec_config"]["num_quantizers"])
+        if nq is None:
+            self.effective_nq = n_vq
+            return self.effective_nq
+        requested_nq = int(nq)
+        if requested_nq < 1 or requested_nq > n_vq:
+            raise ValueError(f"nq must be between 1 and {n_vq}, got {requested_nq}")
+        if requested_nq != codec_quantizers:
+            raise ValueError(
+                f"ONNX nq={requested_nq} is not supported by this codec export. "
+                f"The codec graph requires exactly {codec_quantizers} VQ channels; "
+                "partial-quantizer decode would require a new ONNX codec export."
+            )
+        self.effective_nq = requested_nq
+        return self.effective_nq
 
     def resolve_manifest_relative_path(self, relative_path: str | Path) -> Path:
         relative = Path(relative_path)
@@ -643,7 +662,15 @@ class OrtCpuRuntime:
     def decode_full_audio(self, generated_frames: list[list[int]]) -> tuple[list[np.ndarray], int]:
         if not generated_frames:
             return [], 0
-        audio_codes, dims = _flatten3d_int32([generated_frames])
+        num_quantizers = int(self.codec_meta["codec_config"]["num_quantizers"])
+        codec_frames = [
+            [
+                int(frame_row[channel_index]) if channel_index < len(frame_row) else 0
+                for channel_index in range(num_quantizers)
+            ]
+            for frame_row in generated_frames
+        ]
+        audio_codes, dims = _flatten3d_int32([codec_frames])
         outputs = self.sessions["codec_decode"].run(
             None,
             {
@@ -662,7 +689,9 @@ class OrtCpuRuntime:
         on_frame: Callable[[list[list[int]], int, list[int]], None] | None = None,
     ) -> list[list[int]]:
         generation_defaults = self.manifest["generation_defaults"]
-        row_width = int(self.manifest["tts_config"]["n_vq"]) + 1
+        n_vq = int(self.manifest["tts_config"]["n_vq"])
+        effective_nq = min(max(1, int(self.effective_nq)), n_vq)
+        row_width = n_vq + 1
         prefill_ids, prefill_dims = _flatten3d_int32([request_rows["inputIds"]])
         prefill_mask, prefill_mask_dims = _flatten2d_int32(request_rows["attentionMask"])
         outputs = self.sessions["prefill"].run(
@@ -681,12 +710,19 @@ class OrtCpuRuntime:
             for output_name in self.tts_meta["onnx"]["prefill_output_names"][1:]
         }
         generated_frames: list[list[int]] = []
-        previous_tokens_by_channel = [[] for _ in range(int(self.manifest["tts_config"]["n_vq"]))]
-        previous_token_sets_by_channel = [set() for _ in range(int(self.manifest["tts_config"]["n_vq"]))]
+        previous_tokens_by_channel = [[] for _ in range(n_vq)]
+        previous_token_sets_by_channel = [set() for _ in range(n_vq)]
+        use_full_width_local_graph = effective_nq == n_vq
+        next_row = np.empty((1, 1, row_width), dtype=np.int32)
+        past_valid_lengths = np.empty((1,), dtype=np.int32)
 
         for step_index in range(int(generation_defaults["max_new_frames"])):
             frame: list[int] = []
-            if "local_greedy_frame" in self.sessions and not bool(generation_defaults["do_sample"]):
+            if (
+                use_full_width_local_graph
+                and "local_greedy_frame" in self.sessions
+                and not bool(generation_defaults["do_sample"])
+            ):
                 should_continue, frame = self.run_local_greedy_frame(
                     global_hidden,
                     previous_token_sets_by_channel=previous_token_sets_by_channel,
@@ -697,7 +733,11 @@ class OrtCpuRuntime:
                 for channel_index, sampled_token in enumerate(frame):
                     previous_tokens_by_channel[channel_index].append(sampled_token)
                     previous_token_sets_by_channel[channel_index].add(sampled_token)
-            elif "local_fixed_sampled_frame" in self.sessions and generation_defaults["sample_mode"] == SAMPLE_MODE_FIXED:
+            elif (
+                use_full_width_local_graph
+                and "local_fixed_sampled_frame" in self.sessions
+                and generation_defaults["sample_mode"] == SAMPLE_MODE_FIXED
+            ):
                 should_continue, frame = self.run_local_fixed_sampled_frame(
                     global_hidden,
                     previous_token_sets_by_channel=previous_token_sets_by_channel,
@@ -751,7 +791,7 @@ class OrtCpuRuntime:
                 previous_token_sets_by_channel[0].add(sampled_token)
 
                 previous_token = sampled_token
-                host_sampled_channel_limit = int(self.manifest["tts_config"]["n_vq"])
+                host_sampled_channel_limit = effective_nq
                 for channel_index in range(1, host_sampled_channel_limit):
                     _unused_text_logits, audio_logits, local_past_by_name = self.run_local_cached_step(
                         global_hidden,
@@ -785,7 +825,7 @@ class OrtCpuRuntime:
                 )
                 if next_text_token != int(self.manifest["tts_config"]["audio_assistant_slot_token_id"]):
                     break
-                for channel_index in range(int(self.manifest["tts_config"]["n_vq"])):
+                for channel_index in range(effective_nq):
                     _, audio_logits = self.run_local_decoder(global_hidden, next_text_token, frame)
                     channel_logits = self.slice_audio_channel_logits(audio_logits, channel_index).astype(np.float32, copy=False)
                     sampled_token = _sample_audio_token(
@@ -800,13 +840,14 @@ class OrtCpuRuntime:
                     previous_token_sets_by_channel[channel_index].add(sampled_token)
             generated_frames.append(frame)
 
-            next_row = np.full((1, 1, row_width), int(self.manifest["tts_config"]["audio_pad_token_id"]), dtype=np.int32)
+            next_row.fill(int(self.manifest["tts_config"]["audio_pad_token_id"]))
             next_row[0, 0, 0] = int(self.manifest["tts_config"]["audio_assistant_slot_token_id"])
             for index, token in enumerate(frame):
                 next_row[0, 0, index + 1] = int(token)
+            past_valid_lengths[0] = past_valid_length
             decode_feeds: dict[str, np.ndarray] = {
                 "input_ids": next_row,
-                "past_valid_lengths": np.asarray([past_valid_length], dtype=np.int32),
+                "past_valid_lengths": past_valid_lengths,
             }
             for input_name in self.tts_meta["onnx"]["decode_input_names"][2:]:
                 decode_feeds[input_name] = past_by_name[input_name]
