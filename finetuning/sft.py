@@ -89,6 +89,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--checkpoint-epoch-offset", type=int, default=0)
     return parser.parse_args()
 
 
@@ -519,10 +520,10 @@ def main() -> None:
                 tokenizer=tokenizer,
                 model_path=args.model_path,
                 codec_path=args.codec_path,
-                output_dir=output_root / f"checkpoint-epoch-{epoch + 1}",
+                output_dir=output_root / f"checkpoint-epoch-{args.checkpoint_epoch_offset + epoch + 1}",
                 train_args=train_args_to_save,
                 global_step=global_step,
-                epoch=epoch + 1,
+                epoch=args.checkpoint_epoch_offset + epoch + 1,
             )
         completed_epochs = epoch + 1
 
@@ -538,7 +539,7 @@ def main() -> None:
         output_dir=output_root / "checkpoint-last",
         train_args=train_args_to_save,
         global_step=global_step,
-        epoch=completed_epochs,
+        epoch=args.checkpoint_epoch_offset + completed_epochs,
     )
     accelerator.print(
         f"[{format_timestamp()}] [sft] finished "
