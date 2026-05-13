@@ -15,6 +15,7 @@ except ImportError:
     _WETEXT_AVAILABLE = False
 
 ENGLISH_VOICES = frozenset({"Trump", "Ava", "Bella", "Adam", "Nathan"})
+WETEXT_NORMALIZER_LANGUAGES = frozenset({"zh", "en"})
 CUSTOM_ZH_WETEXT_CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "wetext_zh_no_erhua_keep_punct"
 _ZH_WETEXT_KEEP_HYPHEN = "___KEEP_HYPHEN_BEFORE_ZH_WETEXT___"
 
@@ -134,7 +135,10 @@ class WeTextProcessingManager:
             return normalized_text, normalized_prompt_text
 
 
-def resolve_text_normalization_language(*, text: str, voice: str) -> str:
+def resolve_text_normalization_language(*, text: str, voice: str, language: str | None = None) -> str:
+    requested_language = str(language or "").strip().lower()
+    if requested_language:
+        return requested_language
     if re.search(r"[\u3400-\u9fff]", text):
         return "zh"
     if re.search(r"[A-Za-z]", text):
@@ -201,6 +205,7 @@ def prepare_tts_request_texts(
     text: str,
     prompt_text: str = "",
     voice: str = "",
+    language: str | None = None,
     enable_wetext: bool,
     enable_normalize_tts_text: bool = True,
     text_normalizer_manager: WeTextProcessingManager | None,
@@ -212,8 +217,9 @@ def prepare_tts_request_texts(
     normalization_language = ""
     intermediate_text = raw_text
     intermediate_prompt_text = raw_prompt_text
+    wetext_enabled_for_request = bool(enable_wetext)
 
-    if enable_normalize_tts_text and enable_wetext:
+    if enable_normalize_tts_text and wetext_enabled_for_request:
         pre_robust_text = normalize_tts_text(raw_text)
         pre_robust_prompt_text = normalize_tts_text(raw_prompt_text) if raw_prompt_text else ""
         if pre_robust_text != raw_text:
@@ -232,56 +238,78 @@ def prepare_tts_request_texts(
         intermediate_prompt_text = pre_robust_prompt_text
         normalization_stages.append("robust_pre")
 
-    if enable_wetext:
+    if wetext_enabled_for_request:
         if text_normalizer_manager is None:
-            raise RuntimeError("WeTextProcessing manager is unavailable.")
+            logging.warning("WeTextProcessing manager unavailable; skipping WeText for this request.")
+            wetext_enabled_for_request = False
+        else:
+            snapshot = text_normalizer_manager.ensure_ready()
+            if not snapshot.ready:
+                logging.warning(
+                    "WeTextProcessing not ready; skipping WeText for this request. reason=%s",
+                    snapshot.error or snapshot.message,
+                )
+                wetext_enabled_for_request = False
+
+    if wetext_enabled_for_request:
         wetext_input_text = intermediate_text
         wetext_input_prompt_text = intermediate_prompt_text
-        normalization_language = resolve_text_normalization_language(text=wetext_input_text, voice=voice)
-        if normalization_language == "zh":
-            rewritten_wetext_input_text = _rewrite_hyphens_before_zh_wetext(wetext_input_text)
-            rewritten_wetext_input_prompt_text = _rewrite_hyphens_before_zh_wetext(wetext_input_prompt_text)
-            if rewritten_wetext_input_text != wetext_input_text:
-                logging.info(
-                    "rewrote zh wetext text hyphens chars_before=%d chars_after=%d stage=zh_wetext_hyphen_guard",
-                    len(wetext_input_text),
-                    len(rewritten_wetext_input_text),
-                )
-            if wetext_input_prompt_text and rewritten_wetext_input_prompt_text != wetext_input_prompt_text:
-                logging.info(
-                    "rewrote zh wetext prompt_text hyphens chars_before=%d chars_after=%d stage=zh_wetext_hyphen_guard",
-                    len(wetext_input_prompt_text),
-                    len(rewritten_wetext_input_prompt_text),
-                )
-            wetext_input_text = rewritten_wetext_input_text
-            wetext_input_prompt_text = rewritten_wetext_input_prompt_text
-        intermediate_text, intermediate_prompt_text = text_normalizer_manager.normalize(
+        normalization_language = resolve_text_normalization_language(
             text=wetext_input_text,
-            prompt_text=wetext_input_prompt_text,
-            language=normalization_language,
+            voice=voice,
+            language=language,
         )
-        if intermediate_text != wetext_input_text:
+        if normalization_language not in WETEXT_NORMALIZER_LANGUAGES:
             logging.info(
-                "normalized text chars_before=%d chars_after=%d stage=wetext language=%s",
-                len(wetext_input_text),
-                len(intermediate_text),
+                "skipping WeTextProcessing for unsupported language=%s; using robust normalizer only",
                 normalization_language,
             )
-        if wetext_input_prompt_text and intermediate_prompt_text != wetext_input_prompt_text:
-            logging.info(
-                "normalized prompt_text chars_before=%d chars_after=%d stage=wetext language=%s",
-                len(wetext_input_prompt_text),
-                len(intermediate_prompt_text),
-                normalization_language,
+            wetext_enabled_for_request = False
+        else:
+            if normalization_language == "zh":
+                rewritten_wetext_input_text = _rewrite_hyphens_before_zh_wetext(wetext_input_text)
+                rewritten_wetext_input_prompt_text = _rewrite_hyphens_before_zh_wetext(wetext_input_prompt_text)
+                if rewritten_wetext_input_text != wetext_input_text:
+                    logging.info(
+                        "rewrote zh wetext text hyphens chars_before=%d chars_after=%d stage=zh_wetext_hyphen_guard",
+                        len(wetext_input_text),
+                        len(rewritten_wetext_input_text),
+                    )
+                if wetext_input_prompt_text and rewritten_wetext_input_prompt_text != wetext_input_prompt_text:
+                    logging.info(
+                        "rewrote zh wetext prompt_text hyphens chars_before=%d chars_after=%d stage=zh_wetext_hyphen_guard",
+                        len(wetext_input_prompt_text),
+                        len(rewritten_wetext_input_prompt_text),
+                    )
+                wetext_input_text = rewritten_wetext_input_text
+                wetext_input_prompt_text = rewritten_wetext_input_prompt_text
+            intermediate_text, intermediate_prompt_text = text_normalizer_manager.normalize(
+                text=wetext_input_text,
+                prompt_text=wetext_input_prompt_text,
+                language=normalization_language,
             )
-        normalization_stages.append(f"wetext:{normalization_language}" if normalization_language else "wetext")
+            if intermediate_text != wetext_input_text:
+                logging.info(
+                    "normalized text chars_before=%d chars_after=%d stage=wetext language=%s",
+                    len(wetext_input_text),
+                    len(intermediate_text),
+                    normalization_language,
+                )
+            if wetext_input_prompt_text and intermediate_prompt_text != wetext_input_prompt_text:
+                logging.info(
+                    "normalized prompt_text chars_before=%d chars_after=%d stage=wetext language=%s",
+                    len(wetext_input_prompt_text),
+                    len(intermediate_prompt_text),
+                    normalization_language,
+                )
+            normalization_stages.append(f"wetext:{normalization_language}" if normalization_language else "wetext")
 
     final_text = intermediate_text
     final_prompt_text = intermediate_prompt_text
     if enable_normalize_tts_text:
         final_text = normalize_tts_text(intermediate_text)
         final_prompt_text = normalize_tts_text(intermediate_prompt_text) if intermediate_prompt_text else ""
-        robust_stage_name = "robust_post" if enable_wetext else "robust"
+        robust_stage_name = "robust_post" if wetext_enabled_for_request else "robust"
 
         if final_text != intermediate_text:
             logging.info(
@@ -306,7 +334,7 @@ def prepare_tts_request_texts(
         "normalized_prompt_text": final_prompt_text,
         "normalization_method": "+".join(normalization_stages) if normalization_stages else "none",
         "text_normalization_language": normalization_language,
-        "text_normalization_enabled": bool(enable_wetext or enable_normalize_tts_text),
-        "wetext_processing_enabled": bool(enable_wetext),
+        "text_normalization_enabled": bool(wetext_enabled_for_request or enable_normalize_tts_text),
+        "wetext_processing_enabled": bool(wetext_enabled_for_request),
         "normalize_tts_text_enabled": bool(enable_normalize_tts_text),
     }

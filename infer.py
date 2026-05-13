@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import logging
+import sys
 import time
 from pathlib import Path
 from typing import Optional, Sequence
@@ -16,7 +18,12 @@ from moss_tts_nano.defaults import (
     DEFAULT_CHECKPOINT_PATH,
     DEFAULT_OUTPUT_DIR,
 )
-from text_normalization_pipeline import WeTextProcessingManager, prepare_tts_request_texts
+from text_normalization_pipeline import WeTextProcessingManager
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from src.text_frontend import apply_harmonized_frontend
 
 MOSS_AUDIO_TOKENIZER_TYPE = "moss-audio-tokenizer-nano"
 DEFAULT_AUDIO_TOKENIZER_PRETRAINED_NAME_OR_PATH = DEFAULT_AUDIO_TOKENIZER_PATH
@@ -36,6 +43,13 @@ def waiting_for_debug(ip: str, port: int) -> None:
     logging.info("waiting for debugger attach at %s:%s", ip, port)
     debugpy.listen((ip, port))
     debugpy.wait_for_client()
+
+
+def supports_kwarg(callable_obj, name: str) -> bool:
+    try:
+        return name in inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -109,10 +123,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--voice-clone-max-text-tokens",
         type=int,
-        default=75,
+        default=0,
         help=(
             "Only for voice_clone mode: pocket-tts style sentence chunking target token budget. "
-            "Set <= 0 to disable chunking and keep single-pass generation."
+            "Default 0 = use the checkpoint's `config.training_chunk_text_tokens_recommended` "
+            "(set by the trainer from the training distribution). Pass a positive integer to "
+            "override, or a negative value to disable chunking and keep single-pass generation."
         ),
     )
     parser.add_argument(
@@ -439,10 +455,11 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
                 raise RuntimeError(snapshot.error or snapshot.message)
         else:
             logging.info("WeTextProcessing ready for infer.py status=%s", snapshot.message)
-    prepared_texts = prepare_tts_request_texts(
+    prepared_texts = apply_harmonized_frontend(
         text=raw_text,
         prompt_text=raw_prompt_text,
         voice="",
+        language=args.lang,
         enable_wetext=enable_wetext_processing,
         enable_normalize_tts_text=enable_normalize_tts_text,
         text_normalizer_manager=text_normalizer_manager,
@@ -452,7 +469,7 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
     logging.info(
         "text normalization method=%s language=%s text_chars=%d prompt_chars=%d",
         prepared_texts["normalization_method"],
-        prepared_texts["text_normalization_language"] or "n/a",
+        prepared_texts.get("text_normalization_language") or "n/a",
         len(text),
         len(prompt_text or ""),
     )
@@ -463,24 +480,28 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
     t_first_audio: float | None = None
     result: dict | None = None
 
-    for event in model.inference_stream(
-        text=text,
-        output_audio_path=args.output_audio_path,
-        mode=args.mode,
-        prompt_text=prompt_text,
-        prompt_audio_path=args.prompt_audio_path,
-        reference_audio_path=args.reference_audio_path,
-        text_tokenizer_path=args.text_tokenizer_path or args.checkpoint,
-        audio_tokenizer=codec,
-        device=device,
-        nq=args.nq,
-        max_new_frames=args.max_new_frames,
-        voice_clone_max_text_tokens=args.voice_clone_max_text_tokens,
-        voice_clone_max_memory_per_sample_gb=args.voice_clone_max_memory_per_sample_gb,
-        do_sample=bool(args.do_sample),
-        use_kv_cache=True,
+    inference_kwargs = {
+        "text": text,
+        "output_audio_path": args.output_audio_path,
+        "mode": args.mode,
+        "prompt_text": prompt_text,
+        "prompt_audio_path": args.prompt_audio_path,
+        "reference_audio_path": args.reference_audio_path,
+        "text_tokenizer_path": args.text_tokenizer_path or args.checkpoint,
+        "audio_tokenizer": codec,
+        "device": device,
+        "nq": args.nq,
+        "max_new_frames": args.max_new_frames,
+        "voice_clone_max_text_tokens": args.voice_clone_max_text_tokens,
+        "voice_clone_max_memory_per_sample_gb": args.voice_clone_max_memory_per_sample_gb,
+        "do_sample": bool(args.do_sample),
+        "use_kv_cache": True,
         **sampling_kwargs,
-    ):
+    }
+    if args.lang and supports_kwarg(model.inference_stream, "language"):
+        inference_kwargs["language"] = args.lang
+
+    for event in model.inference_stream(**inference_kwargs):
         if event.get("type") == "audio" and t_first_audio is None:
             t_first_audio = time.perf_counter()
         elif event.get("type") == "result":

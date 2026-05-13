@@ -5,6 +5,13 @@ Checkpoint selection convention:
   N    -> models/checkpoints/<lang>/final/checkpoint-epoch-N   (PyTorch)
            or  models/checkpoints/<lang>/final-onnx/checkpoint-epoch-N  (ONNX)
   last -> checkpoint-last (latest saved epoch)
+
+The base model ships with the default MOSS text tokenizer (en/zh). Finetuned
+checkpoints bundle the phoneme-aware tokenizer. So the resolver falls back to
+the default base whenever phoneme-aware finetuning does not apply:
+- no language requested
+- language is 'en' or 'zh' (covered natively by the base tokenizer)
+- checkpoint spec is '0'
 """
 from __future__ import annotations
 
@@ -13,6 +20,19 @@ from pathlib import Path
 # Two levels up from .local_deps/MOSS-TTS-Nano/
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CHECKPOINTS_ROOT = PROJECT_ROOT / "models" / "checkpoints"
+
+# Languages served by the default MOSS text tokenizer, no phoneme finetune needed.
+DEFAULT_TOKENIZER_LANGS = frozenset({"en", "zh"})
+
+
+def _use_default_base(lang: str | None, checkpoint_spec: str) -> bool:
+    if not lang:
+        return True
+    if lang.strip().lower() in DEFAULT_TOKENIZER_LANGS:
+        return True
+    if checkpoint_spec == "0":
+        return True
+    return False
 
 
 def add_checkpoint_args(parser) -> None:
@@ -43,12 +63,14 @@ def resolve_pytorch_checkpoint(
 ) -> str:
     """Return the HF repo-id or local path for a PyTorch checkpoint.
 
-    Without --lang the checkpoint_spec is used as-is (path or HF id).
-    With --lang: 0 = base model, N = checkpoint-epoch-N, last = checkpoint-last.
+    Default base (with default MOSS tokenizer) is returned when:
+      - no --lang is set,
+      - --lang is 'en' or 'zh' (default tokenizer covers them),
+      - or --checkpoint is '0'.
+    Otherwise a phoneme-aware finetuned checkpoint dir is returned:
+      N = checkpoint-epoch-N, last = checkpoint-last.
     """
-    if not lang:
-        return checkpoint_spec  # original path / HF id passthrough
-    if checkpoint_spec == "0":
+    if _use_default_base(lang, checkpoint_spec):
         return default_checkpoint
 
     final_dir = CHECKPOINTS_ROOT / lang / "final"
@@ -84,8 +106,12 @@ def resolve_onnx_model_dir(
     lang: str | None,
     checkpoint_spec: str,
 ) -> str | None:
-    """Return the ONNX model-dir path, or None to use the built-in default."""
-    if not lang or checkpoint_spec == "0":
+    """Return the ONNX model-dir path, or None to use the built-in default.
+
+    Mirrors :func:`resolve_pytorch_checkpoint`: en/zh and checkpoint '0' use the
+    bundled default ONNX model; other languages load the finetuned export dir.
+    """
+    if _use_default_base(lang, checkpoint_spec):
         return None
 
     onnx_base = CHECKPOINTS_ROOT / lang / "final-onnx"

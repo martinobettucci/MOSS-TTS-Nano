@@ -94,7 +94,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "16-channel input; lower values are rejected instead of producing invalid audio."
         ),
     )
-    parser.add_argument("--voice-clone-max-text-tokens", type=int, default=75, help="Chunk long text by token budget.")
+    parser.add_argument(
+        "--voice-clone-max-text-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Chunk long text by token budget. 0 (default) = use the checkpoint's "
+            "`config.training_chunk_text_tokens_recommended` (set by trainer). "
+            "Positive int = explicit override. Negative = disable chunking."
+        ),
+    )
     parser.add_argument("--text-temperature", type=float, default=1.0, help="Text-layer sampling temperature.")
     parser.add_argument("--text-top-p", type=float, default=1.0, help="Text-layer top-p sampling.")
     parser.add_argument("--text-top-k", type=int, default=50, help="Text-layer top-k sampling.")
@@ -310,6 +319,7 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
     prepared = runtime.prepare_synthesis_text(
         text=raw_text,
         voice=str(args.voice or ""),
+        language=args.lang,
         enable_wetext=enable_wetext,
         enable_normalize_tts_text=enable_normalize_tts_text,
     )
@@ -331,6 +341,7 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
         text=raw_text,
         voice=args.voice,
         prompt_audio_path=args.prompt_audio_path,
+        language=args.lang,
         output_audio_path=args.output_audio_path,
         sample_mode=args.sample_mode,
         do_sample=bool(args.do_sample),

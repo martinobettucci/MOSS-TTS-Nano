@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
+import sys
 import threading
 import time
 import uuid
@@ -21,7 +23,18 @@ from moss_tts_nano.defaults import (
     DEFAULT_PROMPT_AUDIO_DIR,
 )
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 MOSS_AUDIO_TOKENIZER_TYPE = "moss-audio-tokenizer-nano"
+
+
+def _supports_kwarg(callable_obj, name: str) -> bool:
+    try:
+        return name in inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return False
 
 _DEFAULT_VOICE_FILES: dict[str, tuple[str, str]] = {
     "Junhao": ("zh_1.wav", "Chinese male voice A"),
@@ -387,8 +400,11 @@ class NanoTTSService:
         self,
         *,
         text: str,
-        voice_clone_max_text_tokens: int = 75,
+        voice_clone_max_text_tokens: int = 0,
     ) -> list[str]:
+        """Split text into chunks. Budget semantics:
+        > 0 explicit  |  == 0 auto from model config  |  < 0 disabled
+        """
         normalized_text = str(text or "").strip()
         if not normalized_text:
             return []
@@ -396,8 +412,8 @@ class NanoTTSService:
         try:
             max_tokens = int(voice_clone_max_text_tokens)
         except Exception:
-            max_tokens = 75
-        if max_tokens <= 0:
+            max_tokens = 0
+        if max_tokens < 0:
             return [normalized_text]
 
         with self._lock:
@@ -409,6 +425,7 @@ class NanoTTSService:
                 text_tokenizer=None,
                 text_tokenizer_path=self.checkpoint_path,
             )
+            # The model's patched helper resolves 0 → config.training_chunk_text_tokens_recommended.
             split_chunks = model._split_text_into_best_sentences(
                 text_tokenizer=text_tokenizer,
                 text=normalized_text,
@@ -476,11 +493,12 @@ class NanoTTSService:
         text: str,
         voice: Optional[str] = None,
         mode: str = "voice_clone",
+        language: Optional[str] = None,
         output_audio_path: Optional[str | Path] = None,
         prompt_audio_path: Optional[str | Path] = None,
         prompt_text: Optional[str] = None,
         max_new_frames: int = 375,
-        voice_clone_max_text_tokens: int = 75,
+        voice_clone_max_text_tokens: int = 0,
         voice_clone_max_memory_per_sample_gb: float = 1.0,
         tts_max_batch_size: int = 0,
         codec_max_batch_size: int = 0,
@@ -543,32 +561,36 @@ class NanoTTSService:
                 if torch.cuda.is_available():
                     torch.cuda.manual_seed_all(seed)
 
+            inference_kwargs = {
+                "text": normalized_text,
+                "output_audio_path": str(output_path),
+                "mode": normalized_mode,
+                "prompt_text": prompt_text,
+                "prompt_audio_path": None if effective_prompt_audio_path is None else str(effective_prompt_audio_path),
+                "text_tokenizer_path": self.checkpoint_path,
+                "audio_tokenizer": audio_tokenizer,
+                "device": self.device,
+                "nq": nq,
+                "max_new_frames": int(max_new_frames),
+                "voice_clone_max_text_tokens": int(voice_clone_max_text_tokens),
+                "voice_clone_max_memory_per_sample_gb": float(voice_clone_max_memory_per_sample_gb),
+                "tts_max_batch_size": int(tts_max_batch_size),
+                "codec_max_batch_size": int(codec_max_batch_size),
+                "do_sample": bool(do_sample),
+                "use_kv_cache": True,
+                "text_temperature": float(text_temperature),
+                "text_top_p": float(text_top_p),
+                "text_top_k": int(text_top_k),
+                "audio_temperature": float(audio_temperature),
+                "audio_top_p": float(audio_top_p),
+                "audio_top_k": int(audio_top_k),
+                "audio_repetition_penalty": float(audio_repetition_penalty),
+            }
+            if language and _supports_kwarg(model.inference, "language"):
+                inference_kwargs["language"] = language
+
             try:
-                result = model.inference(
-                    text=normalized_text,
-                    output_audio_path=str(output_path),
-                    mode=normalized_mode,
-                    prompt_text=prompt_text,
-                    prompt_audio_path=None if effective_prompt_audio_path is None else str(effective_prompt_audio_path),
-                    text_tokenizer_path=self.checkpoint_path,
-                    audio_tokenizer=audio_tokenizer,
-                    device=self.device,
-                    nq=nq,
-                    max_new_frames=int(max_new_frames),
-                    voice_clone_max_text_tokens=int(voice_clone_max_text_tokens),
-                    voice_clone_max_memory_per_sample_gb=float(voice_clone_max_memory_per_sample_gb),
-                    tts_max_batch_size=int(tts_max_batch_size),
-                    codec_max_batch_size=int(codec_max_batch_size),
-                    do_sample=bool(do_sample),
-                    use_kv_cache=True,
-                    text_temperature=float(text_temperature),
-                    text_top_p=float(text_top_p),
-                    text_top_k=int(text_top_k),
-                    audio_temperature=float(audio_temperature),
-                    audio_top_p=float(audio_top_p),
-                    audio_top_k=int(audio_top_k),
-                    audio_repetition_penalty=float(audio_repetition_penalty),
-                )
+                result = model.inference(**inference_kwargs)
             except Exception:
                 self._discard_loaded_audio_tokenizer_locked(
                     "inference failed; reloading audio tokenizer on next request"
@@ -611,11 +633,12 @@ class NanoTTSService:
         text: str,
         voice: Optional[str] = None,
         mode: str = "voice_clone",
+        language: Optional[str] = None,
         output_audio_path: Optional[str | Path] = None,
         prompt_audio_path: Optional[str | Path] = None,
         prompt_text: Optional[str] = None,
         max_new_frames: int = 375,
-        voice_clone_max_text_tokens: int = 75,
+        voice_clone_max_text_tokens: int = 0,
         voice_clone_max_memory_per_sample_gb: float = 1.0,
         tts_max_batch_size: int = 0,
         codec_max_batch_size: int = 0,
@@ -679,32 +702,36 @@ class NanoTTSService:
                 if torch.cuda.is_available():
                     torch.cuda.manual_seed_all(seed)
 
+            stream_kwargs = {
+                "text": normalized_text,
+                "output_audio_path": str(output_path),
+                "mode": normalized_mode,
+                "prompt_text": prompt_text,
+                "prompt_audio_path": None if effective_prompt_audio_path is None else str(effective_prompt_audio_path),
+                "text_tokenizer_path": self.checkpoint_path,
+                "audio_tokenizer": audio_tokenizer,
+                "device": self.device,
+                "nq": nq,
+                "max_new_frames": int(max_new_frames),
+                "voice_clone_max_text_tokens": int(voice_clone_max_text_tokens),
+                "voice_clone_max_memory_per_sample_gb": float(voice_clone_max_memory_per_sample_gb),
+                "tts_max_batch_size": int(tts_max_batch_size),
+                "codec_max_batch_size": int(codec_max_batch_size),
+                "do_sample": bool(do_sample),
+                "use_kv_cache": True,
+                "text_temperature": float(text_temperature),
+                "text_top_p": float(text_top_p),
+                "text_top_k": int(text_top_k),
+                "audio_temperature": float(audio_temperature),
+                "audio_top_p": float(audio_top_p),
+                "audio_top_k": int(audio_top_k),
+                "audio_repetition_penalty": float(audio_repetition_penalty),
+            }
+            if language and _supports_kwarg(model.inference_stream, "language"):
+                stream_kwargs["language"] = language
+
             try:
-                for event in model.inference_stream(
-                    text=normalized_text,
-                    output_audio_path=str(output_path),
-                    mode=normalized_mode,
-                    prompt_text=prompt_text,
-                    prompt_audio_path=None if effective_prompt_audio_path is None else str(effective_prompt_audio_path),
-                    text_tokenizer_path=self.checkpoint_path,
-                    audio_tokenizer=audio_tokenizer,
-                    device=self.device,
-                    nq=nq,
-                    max_new_frames=int(max_new_frames),
-                    voice_clone_max_text_tokens=int(voice_clone_max_text_tokens),
-                    voice_clone_max_memory_per_sample_gb=float(voice_clone_max_memory_per_sample_gb),
-                    tts_max_batch_size=int(tts_max_batch_size),
-                    codec_max_batch_size=int(codec_max_batch_size),
-                    do_sample=bool(do_sample),
-                    use_kv_cache=True,
-                    text_temperature=float(text_temperature),
-                    text_top_p=float(text_top_p),
-                    text_top_k=int(text_top_k),
-                    audio_temperature=float(audio_temperature),
-                    audio_top_p=float(audio_top_p),
-                    audio_top_k=int(audio_top_k),
-                    audio_repetition_penalty=float(audio_repetition_penalty),
-                ):
+                for event in model.inference_stream(**stream_kwargs):
                     event_type = str(event.get("type", ""))
                     if event_type == "audio":
                         waveform = torch.as_tensor(event["waveform"], dtype=torch.float32).cpu()

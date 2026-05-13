@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import sys
 import time
 import wave
 from pathlib import Path
@@ -13,10 +14,15 @@ import torch
 import torchaudio
 
 from moss_tts_nano.defaults import DEFAULT_OUTPUT_DIR
-from text_normalization_pipeline import WeTextProcessingManager, prepare_tts_request_texts
+from text_normalization_pipeline import WeTextProcessingManager
 
 APP_DIR = Path(__file__).resolve().parent
 REPO_ROOT = APP_DIR
+PROJECT_ROOT = APP_DIR.parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from src.text_frontend import apply_harmonized_frontend
+
 from ort_cpu_runtime import (
     OrtCpuRuntime,
     _normalize_sample_mode,
@@ -329,14 +335,16 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         text: str,
         voice: str = "",
         prompt_text: str = "",
+        language: str | None = None,
         enable_wetext: bool = True,
         enable_normalize_tts_text: bool = True,
     ) -> dict[str, object]:
         text_normalizer_manager = self._ensure_text_normalizer(enable_wetext)
-        return prepare_tts_request_texts(
+        return apply_harmonized_frontend(
             text=text,
             prompt_text=prompt_text,
             voice=voice,
+            language=language,
             enable_wetext=bool(enable_wetext),
             enable_normalize_tts_text=bool(enable_normalize_tts_text),
             text_normalizer_manager=text_normalizer_manager,
@@ -384,11 +392,20 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             remaining_text = remaining_text[cut_index:].strip()
         return pieces
 
-    def split_voice_clone_text(self, text: str, max_tokens: int = 75) -> list[str]:
+    def split_voice_clone_text(self, text: str, max_tokens: int = 0) -> list[str]:
         normalized_text = str(text or "").strip()
         if not normalized_text:
             return []
-        safe_max_tokens = max(1, int(max_tokens))
+        # Budget semantics:  > 0 explicit  |  == 0 auto from manifest  |  < 0 disabled
+        mt = int(max_tokens)
+        if mt == 0:
+            try:
+                mt = int(self.manifest.get("training_chunk_text_tokens_recommended", 0) or 0)
+            except Exception:
+                mt = 0
+        if mt < 0:
+            return [normalized_text]
+        safe_max_tokens = max(1, mt)
         prepared_text = _prepare_text_for_sentence_chunking(normalized_text)
         sentence_candidates = _split_text_by_punctuation(prepared_text, SENTENCE_END_PUNCTUATION) or [prepared_text.strip()]
         sentence_slices: list[tuple[int, str]] = []
@@ -528,11 +545,12 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         self,
         *,
         text: str,
+        language: str | None = None,
         prompt_audio_codes: list[list[int]],
         streaming: bool,
     ) -> dict[str, Any]:
         text_token_ids = self.encode_text(text)
-        request_rows = self.build_voice_clone_request_rows(prompt_audio_codes, text_token_ids)
+        request_rows = self.build_voice_clone_request_rows(prompt_audio_codes, text_token_ids, language=language)
         if not streaming:
             generated_frames = self.generate_audio_frames(request_rows)
             waveform = self.decode_full_audio_safe(generated_frames)
@@ -601,13 +619,14 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         text: str,
         voice: str | None = None,
         prompt_audio_path: str | Path | None = None,
+        language: str | None = None,
         output_audio_path: str | Path | None = None,
         sample_mode: str | None = None,
         do_sample: bool = True,
         streaming: bool = False,
         max_new_frames: int | None = None,
         nq: int | None = None,
-        voice_clone_max_text_tokens: int = 75,
+        voice_clone_max_text_tokens: int = 0,
         enable_wetext: bool = True,
         enable_normalize_tts_text: bool = True,
         seed: int | None = None,
@@ -623,6 +642,7 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         prepared_texts = self.prepare_synthesis_text(
             text=text,
             voice=str(voice or ""),
+            language=language,
             enable_wetext=enable_wetext,
             enable_normalize_tts_text=enable_normalize_tts_text,
         )
@@ -637,6 +657,7 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         for chunk_index, chunk_text in enumerate(text_chunks):
             chunk_result = self.synthesize_single_chunk(
                 text=chunk_text,
+                language=language,
                 prompt_audio_codes=prompt_audio_codes,
                 streaming=bool(streaming),
             )

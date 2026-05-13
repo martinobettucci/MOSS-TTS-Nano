@@ -217,3 +217,19 @@ models/MOSS-TTS-Nano-100M-ONNX/moss_tts_local_shared.data
 models/MOSS-TTS-Nano-100M-ONNX/moss_tts_prefill.onnx
 models/MOSS-TTS-Nano-100M-ONNX/tokenizer.model
 models/MOSS-TTS-Nano-100M-ONNX/tts_browser_onnx_meta.json
+
+# Local generated/downloaded artifacts
+.cache/
+.app_prompt_uploads/
+generated_audio/
+models/
+onnx/
+*.wav
+*.flac
+*.mp3
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.data

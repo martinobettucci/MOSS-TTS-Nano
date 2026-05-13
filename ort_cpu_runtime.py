@@ -510,14 +510,33 @@ class OrtCpuRuntime:
             rows.append(row)
         return rows
 
-    def build_voice_clone_request_rows(self, prompt_audio_codes: list[list[int]], text_token_ids: list[int]) -> dict[str, list[list[int]]]:
+    def build_user_prompt_after_reference_token_ids(self, language: str | None = None) -> list[int]:
+        if not language:
+            return list(self.manifest["prompt_templates"]["user_prompt_after_reference_token_ids"])
+        suffix = (
+            "\n- Instruction:\nNone\n"
+            "- Tokens:\nNone\n"
+            "- Quality:\nNone\n"
+            "- Sound Event:\nNone\n"
+            "- Ambient Sound:\nNone\n"
+            f"- Language:\n{language}\n"
+            "- Text:\n"
+        )
+        return self.encode_text(suffix)
+
+    def build_voice_clone_request_rows(
+        self,
+        prompt_audio_codes: list[list[int]],
+        text_token_ids: list[int],
+        language: str | None = None,
+    ) -> dict[str, list[list[int]]]:
         prefix_text_token_ids = [
             *self.manifest["prompt_templates"]["user_prompt_prefix_token_ids"],
             int(self.manifest["tts_config"]["audio_start_token_id"]),
         ]
         suffix_text_token_ids = [
             int(self.manifest["tts_config"]["audio_end_token_id"]),
-            *self.manifest["prompt_templates"]["user_prompt_after_reference_token_ids"],
+            *self.build_user_prompt_after_reference_token_ids(language=language),
             *text_token_ids,
             *self.manifest["prompt_templates"]["assistant_prompt_prefix_token_ids"],
             int(self.manifest["tts_config"]["audio_start_token_id"]),

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import queue
+import sys
 import tempfile
 import threading
 import time
@@ -33,8 +34,12 @@ from moss_tts_nano_runtime import (
 from text_normalization_pipeline import (
     TextNormalizationSnapshot as SharedTextNormalizationSnapshot,
     WeTextProcessingManager as SharedWeTextProcessingManager,
-    prepare_tts_request_texts as shared_prepare_tts_request_texts,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from src.text_frontend import apply_harmonized_frontend as shared_prepare_tts_request_texts  # noqa: E402
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -227,13 +232,11 @@ class WarmupManager:
                 )
                 normalization_snapshot = self.text_normalizer_manager.ensure_ready()
                 if normalization_snapshot.failed:
-                    if not normalization_snapshot.available:
-                        logging.warning(
-                            "WeTextProcessing is not installed; disabling text normalization for app server."
-                        )
-                        self.text_normalizer_manager = None
-                    else:
-                        raise RuntimeError(normalization_snapshot.error or normalization_snapshot.message)
+                    logging.warning(
+                        "WeTextProcessing unavailable during warmup; disabling text normalization. reason=%s",
+                        normalization_snapshot.error or normalization_snapshot.message,
+                    )
+                    self.text_normalizer_manager = None
             self._set_state(
                 state="ready",
                 progress=1.0,
@@ -1175,7 +1178,7 @@ def _render_index_html(
             </div>
             <div class="field">
               <label for="voice-clone-max-text-tokens">Voice Clone Max Text Tokens</label>
-              <input id="voice-clone-max-text-tokens" type="number" min="25" max="200" step="1" value="75">
+              <input id="voice-clone-max-text-tokens" type="number" min="0" max="200" step="1" value="0" title="0 = use checkpoint's training-distribution recommendation">
             </div>
           </div>
           <div class="row">
@@ -2269,6 +2272,7 @@ def _build_app(
     warmup_manager: WarmupManager,
     text_normalizer_manager: WeTextProcessingManager | None,
     root_path: str | None,
+    language: str | None = None,
 ) -> FastAPI:
     app = FastAPI(title="MOSS-TTS-Nano Demo", root_path=root_path or "")
     stream_jobs = StreamingJobManager()
@@ -2417,6 +2421,7 @@ def _build_app(
                 return selected_runtime.synthesize_stream(
                     text=text,
                     mode="voice_clone",
+                    language=language,
                     voice=None,
                     prompt_audio_path=prompt_audio_path,
                     max_new_frames=int(max_new_frames),
@@ -2614,7 +2619,7 @@ def _build_app(
         demo_id: str = Form(""),
         prompt_audio: UploadFile | None = File(None),
         max_new_frames: int = Form(375),
-        voice_clone_max_text_tokens: int = Form(75),
+        voice_clone_max_text_tokens: int = Form(0),
         tts_max_batch_size: int = Form(0),
         codec_max_batch_size: int = Form(0),
         enable_text_normalization: str = Form("1"),
@@ -2646,6 +2651,7 @@ def _build_app(
         try:
             prepared_texts = shared_prepare_tts_request_texts(
                 text=resolved_text,
+                language=language,
                 enable_wetext=_coerce_bool(enable_text_normalization, False),
                 enable_normalize_tts_text=_coerce_bool(enable_normalize_tts_text, True),
                 text_normalizer_manager=text_normalizer_manager,
@@ -2825,7 +2831,7 @@ def _build_app(
         demo_id: str = Form(""),
         prompt_audio: UploadFile | None = File(None),
         max_new_frames: int = Form(375),
-        voice_clone_max_text_tokens: int = Form(75),
+        voice_clone_max_text_tokens: int = Form(0),
         tts_max_batch_size: int = Form(0),
         codec_max_batch_size: int = Form(0),
         enable_text_normalization: str = Form("1"),
@@ -2859,6 +2865,7 @@ def _build_app(
         try:
             prepared_texts = shared_prepare_tts_request_texts(
                 text=resolved_text,
+                language=language,
                 enable_wetext=_coerce_bool(enable_text_normalization, False),
                 enable_normalize_tts_text=_coerce_bool(enable_normalize_tts_text, True),
                 text_normalizer_manager=text_normalizer_manager,
@@ -2882,8 +2889,9 @@ def _build_app(
 
             def _synthesize(selected_runtime: NanoTTSService):
                 return selected_runtime.synthesize(
-                    text=str(prepared_texts["text"]),
+                text=str(prepared_texts["text"]),
                     mode="voice_clone",
+                    language=language,
                     voice=None,
                     prompt_audio_path=prompt_audio_path,
                     max_new_frames=int(max_new_frames),
@@ -3034,7 +3042,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if args.share:
         logging.warning("--share is ignored by the FastAPI-based Nano-TTS app.")
 
-    app = _build_app(runtime, warmup_manager, text_normalizer_manager, root_path)
+    app = _build_app(runtime, warmup_manager, text_normalizer_manager, root_path, language=args.lang)
     uvicorn.run(
         app,
         host=args.host,

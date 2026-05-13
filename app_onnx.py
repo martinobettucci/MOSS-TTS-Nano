@@ -50,6 +50,7 @@ class OnnxNanoTTSServiceAdapter:
         execution_provider: str = "cpu",
         max_new_frames: int = 375,
         text_normalizer_manager: WeTextProcessingManager | None = None,
+        language: str | None = None,
     ) -> None:
         self.output_dir = Path(output_dir or (APP_DIR / "generated_audio")).expanduser().resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -62,6 +63,7 @@ class OnnxNanoTTSServiceAdapter:
         )
         self.model_dir = self.runtime.model_dir
         self.runtime._text_normalizer_manager = text_normalizer_manager
+        self.language = language
         self.execution_provider = self.runtime.execution_provider
         self.device = _OnnxDeviceInfo(self.execution_provider)
         self.dtype = "float32"
@@ -187,6 +189,7 @@ class OnnxNanoTTSServiceAdapter:
         audio_top_k: int = 25,
         audio_repetition_penalty: float = 1.2,
         seed: int | None = None,
+        language: str | None = None,
     ) -> dict[str, object]:
         del mode, tts_max_batch_size, codec_max_batch_size
         resolved_sample_mode = self._resolve_sample_mode(attn_implementation, do_sample=do_sample)
@@ -208,6 +211,7 @@ class OnnxNanoTTSServiceAdapter:
             text=str(text or ""),
             voice=voice,
             prompt_audio_path=prompt_audio_path,
+            language=language or self.language,
             sample_mode=resolved_sample_mode,
             do_sample=resolved_sample_mode != "greedy",
             streaming=False,
@@ -250,6 +254,7 @@ class OnnxNanoTTSServiceAdapter:
         audio_top_k: int = 25,
         audio_repetition_penalty: float = 1.2,
         seed: int | None = None,
+        language: str | None = None,
     ) -> Iterator[dict[str, object]]:
         del mode, tts_max_batch_size, codec_max_batch_size
         event_queue: "queue.Queue[dict[str, object] | None]" = queue.Queue(maxsize=128)
@@ -271,8 +276,17 @@ class OnnxNanoTTSServiceAdapter:
                     seed=seed,
                 )
                 start_time = time.perf_counter()
+                prepared_text = str(
+                    self.runtime.prepare_synthesis_text(
+                        text=str(text or ""),
+                        language=language or self.language,
+                        enable_wetext=False,
+                        enable_normalize_tts_text=False,
+                    )["text"]
+                )
                 prompt_audio_codes = self.runtime.resolve_prompt_audio_codes(voice=voice, prompt_audio_path=prompt_audio_path)
-                text_chunks = self.runtime.split_voice_clone_text(str(text or ""), max_tokens=int(voice_clone_max_text_tokens))
+                text_chunks = self.runtime.split_voice_clone_text(prepared_text, max_tokens=int(voice_clone_max_text_tokens))
+                effective_language = language or self.language
                 sample_rate = int(self.runtime.codec_meta["codec_config"]["sample_rate"])
                 channels = int(self.runtime.codec_meta["codec_config"]["channels"])
                 emitted_samples_total = 0
@@ -282,7 +296,11 @@ class OnnxNanoTTSServiceAdapter:
 
                 for chunk_index, chunk_text in enumerate(text_chunks):
                     text_token_ids = self.runtime.encode_text(chunk_text)
-                    request_rows = self.runtime.build_voice_clone_request_rows(prompt_audio_codes, text_token_ids)
+                    request_rows = self.runtime.build_voice_clone_request_rows(
+                        prompt_audio_codes,
+                        text_token_ids,
+                        language=effective_language,
+                    )
                     pending_decode_frames: list[list[int]] = []
                     emitted_chunks: list[np.ndarray] = []
                     self.runtime.codec_streaming_session.reset()
@@ -400,6 +418,7 @@ class OnnxRequestRuntimeManager:
     _factory_max_new_frames: int = 375
     _factory_execution_provider: str = "cpu"
     _factory_text_normalizer_manager: WeTextProcessingManager | None = None
+    _factory_language: str | None = None
 
     def __init__(self, default_runtime: OnnxNanoTTSServiceAdapter) -> None:
         self.default_runtime = default_runtime
@@ -443,6 +462,7 @@ class OnnxRequestRuntimeManager:
             execution_provider=self._factory_execution_provider,
             max_new_frames=self._factory_max_new_frames,
             text_normalizer_manager=self._factory_text_normalizer_manager,
+            language=self._factory_language,
         )
         self._cpu_runtimes[cpu_threads] = runtime
         return runtime
@@ -630,6 +650,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         execution_provider=args.execution_provider,
         max_new_frames=args.max_new_frames,
         text_normalizer_manager=text_normalizer_manager,
+        language=args.lang,
     )
     warmup_manager = legacy_app.WarmupManager(runtime, text_normalizer_manager=text_normalizer_manager)
     warmup_manager.start()
@@ -639,6 +660,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     OnnxRequestRuntimeManager._factory_max_new_frames = int(args.max_new_frames)
     OnnxRequestRuntimeManager._factory_execution_provider = runtime.execution_provider
     OnnxRequestRuntimeManager._factory_text_normalizer_manager = text_normalizer_manager
+    OnnxRequestRuntimeManager._factory_language = args.lang
     legacy_app.RequestRuntimeManager = OnnxRequestRuntimeManager
     legacy_app._render_index_html = _render_index_html_onnx
 
@@ -648,7 +670,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if args.share:
         logging.warning("--share is ignored by the FastAPI-based ONNX app.")
 
-    app = legacy_app._build_app(runtime, warmup_manager, text_normalizer_manager, root_path)
+    app = legacy_app._build_app(runtime, warmup_manager, text_normalizer_manager, root_path, language=args.lang)
     app.title = "MOSS-TTS-Nano ONNX Demo"
     uvicorn.run(
         app,

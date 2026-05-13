@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 import time
 from pathlib import Path
@@ -36,6 +37,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     prompt_text_group.add_argument("--prompt-text-file", help="UTF-8 prompt transcript file.")
 
     parser.add_argument("--mode", default="voice_clone", choices=("continuation", "voice_clone"))
+    parser.add_argument("--language", default=None, help="Optional language code for prompt conditioning, e.g. fr.")
     parser.add_argument("--prompt-audio-path", default=None)
     parser.add_argument("--reference-audio-path", default=None, help="Compatibility alias for --prompt-audio-path.")
     parser.add_argument(
@@ -189,6 +191,25 @@ def _run_warmup(model: AutoModelForCausalLM, device: torch.device, codec, nq: in
     print(f"[warmup] done in {time.perf_counter() - t_wu:.2f}s", flush=True)
 
 
+def _supports_kwarg(callable_obj, name: str) -> bool:
+    try:
+        return name in inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _build_inference_input_ids(model: AutoModelForCausalLM, *, language: str | None = None, **kwargs):
+    if language and _supports_kwarg(model.build_inference_input_ids, "language"):
+        kwargs["language"] = language
+    return model.build_inference_input_ids(**kwargs)
+
+
+def _inference_stream(model: AutoModelForCausalLM, *, language: str | None = None, **kwargs):
+    if language and _supports_kwarg(model.inference_stream, "language"):
+        kwargs["language"] = language
+    return model.inference_stream(**kwargs)
+
+
 def _local_transformer_step(
     model: AutoModelForCausalLM,
     inputs_embeds: "torch.Tensor",
@@ -216,6 +237,7 @@ def _fast_continuation_inference(
     codec,
     device: torch.device,
     text: str,
+    language: Optional[str],
     checkpoint_path: str,
     nq: Optional[int],
     max_new_frames: int,
@@ -244,8 +266,10 @@ def _fast_continuation_inference(
 
     # ---- tokenise and prefill -----------------------------------------------
     text_tok = model._load_text_tokenizer(text_tokenizer_path=checkpoint_path)
-    input_ids, attention_mask = model.build_inference_input_ids(
-        text=text, text_tokenizer=text_tok, mode="continuation", device=device
+    input_ids, attention_mask = _build_inference_input_ids(
+        model,
+        text=text, text_tokenizer=text_tok, mode="continuation", device=device,
+        language=language,
     )
 
     prefill_embeds = model._build_inputs_embeds(input_ids)
@@ -520,6 +544,7 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
                 codec=codec,
                 device=device,
                 text=text,
+                language=args.language,
                 checkpoint_path=args.checkpoint,
                 nq=args.nq,
                 max_new_frames=args.max_new_frames,
@@ -530,10 +555,12 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
             _cuda_sync(device)
             t_first_audio = result.pop("t_first_audio", None)
         else:
-            for event in model.inference_stream(
+            for event in _inference_stream(
+                model,
                 text=text,
                 output_audio_path=args.output_audio_path,
                 mode=args.mode,
+                language=args.language,
                 prompt_text=prompt_text,
                 prompt_audio_path=args.prompt_audio_path,
                 reference_audio_path=args.reference_audio_path,
