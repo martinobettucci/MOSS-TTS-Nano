@@ -18,6 +18,11 @@ ENGLISH_VOICES = frozenset({"Trump", "Ava", "Bella", "Adam", "Nathan"})
 WETEXT_NORMALIZER_LANGUAGES = frozenset({"zh", "en"})
 CUSTOM_ZH_WETEXT_CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "wetext_zh_no_erhua_keep_punct"
 _ZH_WETEXT_KEEP_HYPHEN = "___KEEP_HYPHEN_BEFORE_ZH_WETEXT___"
+_NORMALIZATION_PROGRESS_EVERY = 100
+_normalization_progress_lock = threading.Lock()
+_normalization_processed_texts = 0
+_normalization_changed_texts = 0
+_normalization_changed_prompt_texts = 0
 
 
 @dataclass(frozen=True)
@@ -200,6 +205,28 @@ def _rewrite_hyphens_before_zh_wetext(text: str) -> str:
     return rewritten.replace(_ZH_WETEXT_KEEP_HYPHEN, "-")
 
 
+def _log_normalization_progress(*, text_changed: bool, prompt_text_changed: bool) -> None:
+    global _normalization_processed_texts, _normalization_changed_texts, _normalization_changed_prompt_texts
+
+    with _normalization_progress_lock:
+        _normalization_processed_texts += 1
+        if text_changed:
+            _normalization_changed_texts += 1
+        if prompt_text_changed:
+            _normalization_changed_prompt_texts += 1
+
+        if _normalization_processed_texts % _NORMALIZATION_PROGRESS_EVERY != 0:
+            return
+
+        logging.info(
+            "text normalization progress processed_texts=%d changed_texts=%d changed_prompt_texts=%d interval=%d",
+            _normalization_processed_texts,
+            _normalization_changed_texts,
+            _normalization_changed_prompt_texts,
+            _NORMALIZATION_PROGRESS_EVERY,
+        )
+
+
 def prepare_tts_request_texts(
     *,
     text: str,
@@ -222,18 +249,6 @@ def prepare_tts_request_texts(
     if enable_normalize_tts_text and wetext_enabled_for_request:
         pre_robust_text = normalize_tts_text(raw_text)
         pre_robust_prompt_text = normalize_tts_text(raw_prompt_text) if raw_prompt_text else ""
-        if pre_robust_text != raw_text:
-            logging.info(
-                "normalized text chars_before=%d chars_after=%d stage=robust_pre",
-                len(raw_text),
-                len(pre_robust_text),
-            )
-        if raw_prompt_text and pre_robust_prompt_text != raw_prompt_text:
-            logging.info(
-                "normalized prompt_text chars_before=%d chars_after=%d stage=robust_pre",
-                len(raw_prompt_text),
-                len(pre_robust_prompt_text),
-            )
         intermediate_text = pre_robust_text
         intermediate_prompt_text = pre_robust_prompt_text
         normalization_stages.append("robust_pre")
@@ -269,18 +284,6 @@ def prepare_tts_request_texts(
             if normalization_language == "zh":
                 rewritten_wetext_input_text = _rewrite_hyphens_before_zh_wetext(wetext_input_text)
                 rewritten_wetext_input_prompt_text = _rewrite_hyphens_before_zh_wetext(wetext_input_prompt_text)
-                if rewritten_wetext_input_text != wetext_input_text:
-                    logging.info(
-                        "rewrote zh wetext text hyphens chars_before=%d chars_after=%d stage=zh_wetext_hyphen_guard",
-                        len(wetext_input_text),
-                        len(rewritten_wetext_input_text),
-                    )
-                if wetext_input_prompt_text and rewritten_wetext_input_prompt_text != wetext_input_prompt_text:
-                    logging.info(
-                        "rewrote zh wetext prompt_text hyphens chars_before=%d chars_after=%d stage=zh_wetext_hyphen_guard",
-                        len(wetext_input_prompt_text),
-                        len(rewritten_wetext_input_prompt_text),
-                    )
                 wetext_input_text = rewritten_wetext_input_text
                 wetext_input_prompt_text = rewritten_wetext_input_prompt_text
             intermediate_text, intermediate_prompt_text = text_normalizer_manager.normalize(
@@ -288,20 +291,6 @@ def prepare_tts_request_texts(
                 prompt_text=wetext_input_prompt_text,
                 language=normalization_language,
             )
-            if intermediate_text != wetext_input_text:
-                logging.info(
-                    "normalized text chars_before=%d chars_after=%d stage=wetext language=%s",
-                    len(wetext_input_text),
-                    len(intermediate_text),
-                    normalization_language,
-                )
-            if wetext_input_prompt_text and intermediate_prompt_text != wetext_input_prompt_text:
-                logging.info(
-                    "normalized prompt_text chars_before=%d chars_after=%d stage=wetext language=%s",
-                    len(wetext_input_prompt_text),
-                    len(intermediate_prompt_text),
-                    normalization_language,
-                )
             normalization_stages.append(f"wetext:{normalization_language}" if normalization_language else "wetext")
 
     final_text = intermediate_text
@@ -310,22 +299,12 @@ def prepare_tts_request_texts(
         final_text = normalize_tts_text(intermediate_text)
         final_prompt_text = normalize_tts_text(intermediate_prompt_text) if intermediate_prompt_text else ""
         robust_stage_name = "robust_post" if wetext_enabled_for_request else "robust"
-
-        if final_text != intermediate_text:
-            logging.info(
-                "normalized text chars_before=%d chars_after=%d stage=%s",
-                len(intermediate_text),
-                len(final_text),
-                robust_stage_name,
-            )
-        if intermediate_prompt_text and final_prompt_text != intermediate_prompt_text:
-            logging.info(
-                "normalized prompt_text chars_before=%d chars_after=%d stage=%s",
-                len(intermediate_prompt_text),
-                len(final_prompt_text),
-                robust_stage_name,
-            )
         normalization_stages.append(robust_stage_name)
+
+    _log_normalization_progress(
+        text_changed=final_text != raw_text,
+        prompt_text_changed=final_prompt_text != raw_prompt_text,
+    )
 
     return {
         "text": final_text,
