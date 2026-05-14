@@ -36,10 +36,6 @@ from text_normalization_pipeline import (
     WeTextProcessingManager as SharedWeTextProcessingManager,
 )
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-from src.text_frontend import apply_harmonized_frontend as shared_prepare_tts_request_texts  # noqa: E402
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -2648,17 +2644,6 @@ def _build_app(
             _maybe_delete_file(prompt_audio_cleanup_path)
             return JSONResponse(status_code=400, content={"error": "text is required."})
 
-        try:
-            prepared_texts = shared_prepare_tts_request_texts(
-                text=resolved_text,
-                language=language,
-                enable_wetext=_coerce_bool(enable_text_normalization, False),
-                enable_normalize_tts_text=_coerce_bool(enable_normalize_tts_text, True),
-                text_normalizer_manager=text_normalizer_manager,
-            )
-        except Exception:
-            _maybe_delete_file(prompt_audio_cleanup_path)
-            raise
         warmup_snapshot = warmup_manager.snapshot()
         if not warmup_snapshot.ready:
             warmup_snapshot = warmup_manager.ensure_ready()
@@ -2671,8 +2656,10 @@ def _build_app(
 
         try:
             normalized_seed = None if seed in {"", "0"} else int(seed)
+            # Engine normalizes raw text internally based on the checkpoint
+            # (phoneme-ASCII or WeText). Clients pass `(text, language)` only.
             text_chunks = _resolve_voice_clone_text_chunks(
-                text=str(prepared_texts["text"]),
+                text=resolved_text,
                 voice_clone_max_text_tokens=int(voice_clone_max_text_tokens),
                 cpu_threads=int(cpu_threads),
             )
@@ -2684,7 +2671,7 @@ def _build_app(
                 target=_run_streaming_job,
                 kwargs={
                     "job": job,
-                    "text": str(prepared_texts["text"]),
+                    "text": resolved_text,
                     "prompt_audio_path": prompt_audio_path,
                     "prompt_audio_display_path": prompt_audio_display_path,
                     "prompt_audio_cleanup_path": prompt_audio_cleanup_path,
@@ -2862,17 +2849,6 @@ def _build_app(
             _maybe_delete_file(prompt_audio_cleanup_path)
             return JSONResponse(status_code=400, content={"error": "text is required."})
 
-        try:
-            prepared_texts = shared_prepare_tts_request_texts(
-                text=resolved_text,
-                language=language,
-                enable_wetext=_coerce_bool(enable_text_normalization, False),
-                enable_normalize_tts_text=_coerce_bool(enable_normalize_tts_text, True),
-                text_normalizer_manager=text_normalizer_manager,
-            )
-        except Exception:
-            _maybe_delete_file(prompt_audio_cleanup_path)
-            raise
         warmup_snapshot = warmup_manager.snapshot()
         if not warmup_snapshot.ready:
             warmup_snapshot = warmup_manager.ensure_ready()
@@ -2887,9 +2863,10 @@ def _build_app(
         try:
             normalized_seed = None if seed in {"", "0"} else int(seed)
 
+            # Engine normalizes raw text internally. Clients pass (text, language) only.
             def _synthesize(selected_runtime: NanoTTSService):
                 return selected_runtime.synthesize(
-                text=str(prepared_texts["text"]),
+                text=resolved_text,
                     mode="voice_clone",
                     language=language,
                     voice=None,

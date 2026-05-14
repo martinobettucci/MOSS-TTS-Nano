@@ -13,6 +13,7 @@ authors = [
 ]
 dependencies = [
   "numpy>=1.24",
+  "phonemizer>=3.2.1",
   "python-multipart>=0.0.9",
   "sentencepiece>=0.1.99",
   "torch==2.11.0+cu130",
@@ -37,10 +38,11 @@ Documentation = "https://studio.mosi.cn/docs/moss-tts-nano"
 moss-tts-nano = "moss_tts_nano.cli:main"
 
 [tool.setuptools]
-packages = ["moss_tts_nano"]
+include-package-data = true
 py-modules = [
   "app",
   "app_onnx",
+  "checkpoint_resolver",
   "infer",
   "infer_onnx",
   "moss_tts_nano_runtime",
@@ -49,6 +51,13 @@ py-modules = [
   "text_normalization_pipeline",
   "tts_robust_normalizer_single_script",
 ]
+
+[tool.setuptools.package-data]
+moss_tts_nano = ["assets/reference_voices/*/*.wav"]
+
+[tool.setuptools.packages.find]
+include = ["moss_tts_nano*"]
+namespaces = true
 
 [[tool.uv.index]]
 url = "https://download.pytorch.org/whl/cu130"

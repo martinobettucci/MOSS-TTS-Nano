@@ -22,6 +22,7 @@ FIXED_SAMPLED_AUDIO_TEMPERATURE = 0.8
 FIXED_SAMPLED_AUDIO_TOP_P = 0.95
 FIXED_SAMPLED_AUDIO_TOP_K = 25
 FIXED_SAMPLED_AUDIO_REPETITION_PENALTY = 1.2
+DEFAULT_VOICE_CLONE_FALLBACK_TEXT_TOKENS = 60
 
 
 def ensure_dir(path: Path) -> Path:
@@ -56,6 +57,39 @@ def _metadata_model_source(raw_value: str | Path) -> str:
     if path_value.is_absolute():
         return path_value.name
     return text.replace("\\", "/")
+
+
+def _metadata_text_frontend_mode(checkpoint_path: Path, config: object) -> str:
+    config_mode = getattr(config, "text_frontend_mode", None)
+    if isinstance(config_mode, str) and config_mode.strip():
+        return config_mode.strip()
+    added_tokens_path = checkpoint_path / "added_tokens.json"
+    if added_tokens_path.is_file():
+        try:
+            added_tokens = json.loads(added_tokens_path.read_text(encoding="utf-8"))
+            if any(str(token).startswith("<ph_") for token in added_tokens):
+                return "phoneme_ascii"
+        except Exception:
+            pass
+    return "ipa"
+
+
+def _metadata_chunking(config: object) -> dict[str, object]:
+    chunking = getattr(config, "voice_clone_chunking", None)
+    if isinstance(chunking, dict):
+        payload = dict(chunking)
+    else:
+        payload = {
+            "budget": "raw_text_bpe_tokens",
+            "auto_budget_config_key": "training_chunk_text_tokens_recommended",
+            "negative_max_tokens": "disabled",
+        }
+    payload["fallback_text_tokens"] = int(
+        payload.get("fallback_text_tokens")
+        or getattr(config, "voice_clone_chunk_fallback_text_tokens", 0)
+        or DEFAULT_VOICE_CLONE_FALLBACK_TEXT_TOKENS
+    )
+    return payload
 
 
 def _flatten_past_key_values(past_key_values: Iterable[tuple[torch.Tensor, torch.Tensor]]) -> tuple[torch.Tensor, ...]:
@@ -1324,6 +1358,12 @@ def main() -> None:
     metadata = {
         "format_version": 1,
         "checkpoint_path": _metadata_model_source(args.checkpoint_path),
+        "text_frontend_mode": _metadata_text_frontend_mode(checkpoint_path, config),
+        "training_chunk_text_tokens_recommended": int(
+            getattr(config, "training_chunk_text_tokens_recommended", 0) or 0
+        ),
+        "training_chunk_text_tokens_stats": getattr(config, "training_chunk_text_tokens_stats", None),
+        "voice_clone_chunking": _metadata_chunking(config),
         "files": {
             "prefill": "moss_tts_prefill.onnx",
             "decode_step": "moss_tts_decode_step.onnx",

@@ -225,6 +225,10 @@ generated_audio/
 models/
 onnx/
 *.wav
+!assets/reference_voices/
+!assets/reference_voices/*.wav
+!assets/reference_voices/**/
+!assets/reference_voices/**/*.wav
 *.flac
 *.mp3
 *.pt

@@ -28,6 +28,7 @@ from finetuning.dataset import MossTTSNanoSFTDataset
 
 DEFAULT_MODEL_PATH = REPO_ROOT / "models" / "MOSS-TTS-Nano"
 DEFAULT_CODEC_PATH = REPO_ROOT / "models" / "MOSS-Audio-Tokenizer-Nano"
+DEFAULT_VOICE_CLONE_FALLBACK_TEXT_TOKENS = 60
 
 SCHEDULER_CHOICES = (
     "linear",
@@ -318,6 +319,57 @@ def resolve_asset(model_path: str, filename: str) -> Optional[Path]:
     return Path(resolved)
 
 
+def _read_json_asset(model_path: str, filename: str) -> dict[str, Any]:
+    asset = resolve_asset(model_path, filename)
+    if asset is None or not asset.exists():
+        return {}
+    try:
+        return json.loads(asset.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _tokenizer_has_phoneme_tokens(tokenizer) -> bool:
+    try:
+        added_vocab = tokenizer.get_added_vocab()
+        if any(str(token).startswith("<ph_") for token in added_vocab):
+            return True
+    except Exception:
+        pass
+    try:
+        vocab = tokenizer.get_vocab()
+        return any(str(token).startswith("<ph_") for token in vocab)
+    except Exception:
+        return False
+
+
+def _resolve_text_frontend_mode(model, tokenizer, model_path: str) -> str:
+    config_mode = getattr(getattr(model, "config", None), "text_frontend_mode", None)
+    if isinstance(config_mode, str) and config_mode.strip():
+        return config_mode.strip()
+    source_config = _read_json_asset(model_path, "config.json")
+    source_mode = source_config.get("text_frontend_mode")
+    if isinstance(source_mode, str) and source_mode.strip():
+        return source_mode.strip()
+    added_tokens = _read_json_asset(model_path, "added_tokens.json")
+    if any(str(token).startswith("<ph_") for token in added_tokens):
+        return "phoneme_ascii"
+    if _tokenizer_has_phoneme_tokens(tokenizer):
+        return "phoneme_ascii"
+    return "ipa"
+
+
+def _attach_inference_metadata(config, *, model, tokenizer, model_path: str) -> None:
+    config.text_frontend_mode = _resolve_text_frontend_mode(model, tokenizer, model_path)
+    config.voice_clone_chunk_fallback_text_tokens = DEFAULT_VOICE_CLONE_FALLBACK_TEXT_TOKENS
+    config.voice_clone_chunking = {
+        "budget": "raw_text_bpe_tokens",
+        "auto_budget_config_key": "training_chunk_text_tokens_recommended",
+        "fallback_text_tokens": DEFAULT_VOICE_CLONE_FALLBACK_TEXT_TOKENS,
+        "negative_max_tokens": "disabled",
+    }
+
+
 def save_checkpoint(
     *,
     accelerator: Accelerator,
@@ -337,6 +389,12 @@ def save_checkpoint(
     output_dir.mkdir(parents=True, exist_ok=True)
     unwrapped_model = unwrap_training_model(model)
     unwrapped_model.config.audio_tokenizer_pretrained_name_or_path = str(Path(codec_path).expanduser().resolve())
+    _attach_inference_metadata(
+        unwrapped_model.config,
+        model=unwrapped_model,
+        tokenizer=tokenizer,
+        model_path=model_path,
+    )
     unwrapped_model.config.save_pretrained(output_dir)
     state_dict = {
         key: value.detach().cpu()

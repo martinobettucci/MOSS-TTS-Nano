@@ -12,14 +12,7 @@ USER_TEMPLATE_SUFFIX = "\n</user_inst>"
 ASSISTANT_TURN_PREFIX = "\n"
 ASSISTANT_ROLE_PREFIX = "assistant\n"
 
-OPTIONAL_MESSAGE_FIELDS = (
-    ("instruction", "Instruction"),
-    ("tokens", "Tokens"),
-    ("quality", "Quality"),
-    ("sound_event", "Sound Event"),
-    ("ambient_sound", "Ambient Sound"),
-    ("language", "Language"),
-)
+_HARDCODED_NONE_FIELDS = ("Instruction", "Tokens", "Quality", "Sound Event", "Ambient Sound")
 
 
 def encode_text(tokenizer, text: str) -> List[int]:
@@ -222,10 +215,12 @@ class MossTTSNanoSFTDataset(Dataset):
 
     def _build_suffix_text(self, record: Dict[str, Any]) -> str:
         lines = [""]
-        for field_name, display_name in OPTIONAL_MESSAGE_FIELDS:
-            value = record.get(field_name)
+        for display_name in _HARDCODED_NONE_FIELDS:
             lines.append(f"- {display_name}:")
-            lines.append("None" if value in (None, "") else str(value))
+            lines.append("None")
+        language = record.get("language")
+        lines.append("- Language:")
+        lines.append(str(language) if language not in (None, "") else "None")
         lines.append("- Text:")
         lines.append(str(record["text"]))
         return "\n".join(lines)

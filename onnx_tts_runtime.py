@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import sys
@@ -18,10 +19,7 @@ from text_normalization_pipeline import WeTextProcessingManager
 
 APP_DIR = Path(__file__).resolve().parent
 REPO_ROOT = APP_DIR
-PROJECT_ROOT = APP_DIR.parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-from src.text_frontend import apply_harmonized_frontend
+from moss_tts_nano.text_frontend import apply_harmonized_frontend
 
 from ort_cpu_runtime import (
     OrtCpuRuntime,
@@ -41,6 +39,7 @@ DEFAULT_BROWSER_ONNX_CODEC_REPO_ID = "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano-ON
 DEFAULT_BROWSER_ONNX_TTS_REPO_URL = f"https://huggingface.co/{DEFAULT_BROWSER_ONNX_TTS_REPO_ID}"
 DEFAULT_BROWSER_ONNX_CODEC_REPO_URL = f"https://huggingface.co/{DEFAULT_BROWSER_ONNX_CODEC_REPO_ID}"
 DEFAULT_BROWSER_ONNX_OUTPUT_PATH = DEFAULT_OUTPUT_DIR / "infer_onnx_output.wav"
+DEFAULT_VOICE_CLONE_FALLBACK_TEXT_TOKENS = 60
 DEFAULT_VOICE_CLONE_INTER_CHUNK_PAUSE_SHORT_SECONDS = 0.40
 DEFAULT_VOICE_CLONE_INTER_CHUNK_PAUSE_LONG_SECONDS = 0.24
 SENTENCE_END_PUNCTUATION = set(".!?。！？；;")
@@ -312,6 +311,38 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         tokenizer_path = self.resolve_manifest_relative_path(tokenizer_relative_path)
         self.sp_model = spm.SentencePieceProcessor(model_file=str(tokenizer_path))
         self._text_normalizer_manager: WeTextProcessingManager | None = None
+        self.text_frontend_mode = self._detect_text_frontend_mode()
+
+    def _detect_text_frontend_mode(self) -> str:
+        """Pick the text frontend this ONNX checkpoint expects.
+
+        Source of truth (in order):
+          1. ``manifest["text_frontend_mode"]`` if the ONNX export wrote it.
+          2. ``added_tokens.json`` in the model dir contains any ``<ph_*>`` key
+             (HF tokenizer keeps phoneme tokens as added tokens, separate from
+             the underlying SentencePiece vocab).
+          3. SentencePiece piece inspection (fallback if added_tokens is absent).
+          4. Default ``"ipa"`` (upstream model).
+        """
+        explicit = self.manifest.get("text_frontend_mode")
+        if isinstance(explicit, str) and explicit:
+            return explicit
+        try:
+            added_path = self.model_dir / "added_tokens.json"
+            if added_path.is_file():
+                added = json.loads(added_path.read_text(encoding="utf-8"))
+                if any(isinstance(k, str) and k.startswith("<ph_") for k in added):
+                    return "phoneme_ascii"
+        except Exception:
+            pass
+        try:
+            for idx in range(self.sp_model.get_piece_size()):
+                piece = self.sp_model.id_to_piece(idx)
+                if isinstance(piece, str) and piece.startswith("<ph_"):
+                    return "phoneme_ascii"
+        except Exception:
+            pass
+        return "ipa"
 
     def _ensure_text_normalizer(self, enable_wetext: bool) -> WeTextProcessingManager | None:
         if not enable_wetext:
@@ -329,6 +360,26 @@ class OnnxTtsRuntime(OrtCpuRuntime):
     def count_text_tokens(self, text: str) -> int:
         return len(self.encode_text(text))
 
+    def resolve_voice_clone_text_token_budget(self, max_tokens: int = 0) -> int:
+        """Resolve voice-clone chunk budget with PyTorch-compatible semantics."""
+        mt = int(max_tokens)
+        if mt != 0:
+            return mt
+        try:
+            mt = int(self.manifest.get("training_chunk_text_tokens_recommended", 0) or 0)
+        except Exception:
+            mt = 0
+        if mt <= 0:
+            chunking = self.manifest.get("voice_clone_chunking")
+            if isinstance(chunking, dict):
+                try:
+                    mt = int(chunking.get("fallback_text_tokens", 0) or 0)
+                except Exception:
+                    mt = 0
+        if mt <= 0:
+            mt = DEFAULT_VOICE_CLONE_FALLBACK_TEXT_TOKENS
+        return mt
+
     def prepare_synthesis_text(
         self,
         *,
@@ -338,7 +389,14 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         language: str | None = None,
         enable_wetext: bool = True,
         enable_normalize_tts_text: bool = True,
+        frontend_mode: str | None = None,
     ) -> dict[str, object]:
+        """Apply the engine's text frontend (phoneme-ASCII or IPA + WeText).
+
+        Auto-selects ``frontend_mode`` from :attr:`text_frontend_mode` when the
+        caller doesn't specify one. This keeps every client to ``(text, language)``.
+        """
+        resolved_mode = frontend_mode if frontend_mode else self.text_frontend_mode
         text_normalizer_manager = self._ensure_text_normalizer(enable_wetext)
         return apply_harmonized_frontend(
             text=text,
@@ -348,6 +406,7 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             enable_wetext=bool(enable_wetext),
             enable_normalize_tts_text=bool(enable_normalize_tts_text),
             text_normalizer_manager=text_normalizer_manager,
+            frontend_mode=resolved_mode,
         )
 
     def split_text_by_token_budget(self, text: str, max_tokens: int) -> list[str]:
@@ -396,16 +455,11 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         normalized_text = str(text or "").strip()
         if not normalized_text:
             return []
-        # Budget semantics:  > 0 explicit  |  == 0 auto from manifest  |  < 0 disabled
-        mt = int(max_tokens)
-        if mt == 0:
-            try:
-                mt = int(self.manifest.get("training_chunk_text_tokens_recommended", 0) or 0)
-            except Exception:
-                mt = 0
+        # Budget semantics: >0 explicit | ==0 manifest or fallback | <0 disabled
+        mt = self.resolve_voice_clone_text_token_budget(max_tokens)
         if mt < 0:
             return [normalized_text]
-        safe_max_tokens = max(1, mt)
+        safe_max_tokens = max(1, int(mt))
         prepared_text = _prepare_text_for_sentence_chunking(normalized_text)
         sentence_candidates = _split_text_by_punctuation(prepared_text, SENTENCE_END_PUNCTUATION) or [prepared_text.strip()]
         sentence_slices: list[tuple[int, str]] = []

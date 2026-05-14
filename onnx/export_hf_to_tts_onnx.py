@@ -157,6 +157,16 @@ def patch_tts_external_data_files(tts_meta_path: Path) -> None:
     ordered_payload = {
         "format_version": payload["format_version"],
         "checkpoint_path": payload["checkpoint_path"],
+        **{
+            key: payload[key]
+            for key in (
+                "text_frontend_mode",
+                "training_chunk_text_tokens_recommended",
+                "training_chunk_text_tokens_stats",
+                "voice_clone_chunking",
+            )
+            if key in payload
+        },
         "files": files,
         "external_data_files": external_data_files,
         "model_config": payload["model_config"],

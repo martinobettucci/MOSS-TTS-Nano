@@ -14,6 +14,7 @@ from onnx_tts_runtime import (
     DEFAULT_BROWSER_ONNX_OUTPUT_PATH,
     OnnxTtsRuntime,
 )
+from moss_tts_nano.reference_voices import resolve_reference_voice_path
 
 
 def set_logging() -> None:
@@ -52,6 +53,22 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         dest="prompt_audio_path",
         default=None,
         help="Local reference audio path used directly for voice cloning. When provided, it overrides --voice.",
+    )
+    gender_group = parser.add_mutually_exclusive_group()
+    gender_group.add_argument(
+        "--male",
+        dest="reference_voice_gender",
+        action="store_const",
+        const="male",
+        default="male",
+        help="Use the bundled male reference voice when no prompt audio path is provided.",
+    )
+    gender_group.add_argument(
+        "--female",
+        dest="reference_voice_gender",
+        action="store_const",
+        const="female",
+        help="Use the bundled female reference voice when no prompt audio path is provided.",
     )
     parser.add_argument(
         "--sample-mode",
@@ -167,6 +184,17 @@ def resolve_text(args: argparse.Namespace) -> str:
     if args.text is not None:
         return str(args.text)
     return Path(args.text_file).read_text(encoding="utf-8")
+
+
+def resolve_prompt_audio_path(args: argparse.Namespace) -> str:
+    if args.prompt_audio_path:
+        return str(args.prompt_audio_path)
+    return str(
+        resolve_reference_voice_path(
+            language=args.lang,
+            gender=args.reference_voice_gender,
+        )
+    )
 
 
 def maybe_print_voice_clone_text_chunks(runtime: OnnxTtsRuntime, text: str, max_tokens: int) -> None:
@@ -314,6 +342,7 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
     generation_defaults["audio_top_k"] = int(args.audio_top_k)
     generation_defaults["audio_repetition_penalty"] = float(args.audio_repetition_penalty)
     raw_text = resolve_text(args)
+    prompt_audio_path = resolve_prompt_audio_path(args)
     enable_wetext = bool(args.enable_wetext_processing) and not bool(args.disable_wetext_processing)
     enable_normalize_tts_text = bool(args.enable_normalize_tts_text) and not bool(args.disable_normalize_tts_text)
     prepared = runtime.prepare_synthesis_text(
@@ -333,14 +362,19 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
     if args.print_voice_clone_text_chunks:
         maybe_print_voice_clone_text_chunks(runtime, prepared_text, args.voice_clone_max_text_tokens)
     if args.prompt_audio_path:
-        logging.info("using direct reference audio path for voice cloning: %s", args.prompt_audio_path)
+        logging.info("using direct reference audio path for voice cloning: %s", prompt_audio_path)
     else:
-        logging.info("using built-in voice preset: %s", args.voice)
+        logging.info(
+            "using bundled %s reference voice for language=%s: %s",
+            args.reference_voice_gender,
+            args.lang or "en",
+            prompt_audio_path,
+        )
     t_gen_start = time.perf_counter()
     result = runtime.synthesize(
         text=raw_text,
         voice=args.voice,
-        prompt_audio_path=args.prompt_audio_path,
+        prompt_audio_path=prompt_audio_path,
         language=args.lang,
         output_audio_path=args.output_audio_path,
         sample_mode=args.sample_mode,

@@ -68,6 +68,22 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Reference speech used for voice cloning.",
     )
+    gender_group = generate_parser.add_mutually_exclusive_group()
+    gender_group.add_argument(
+        "--male",
+        dest="reference_voice_gender",
+        action="store_const",
+        const="male",
+        default="male",
+        help="Use the bundled male reference voice when no prompt speech is provided.",
+    )
+    gender_group.add_argument(
+        "--female",
+        dest="reference_voice_gender",
+        action="store_const",
+        const="female",
+        help="Use the bundled female reference voice when no prompt speech is provided.",
+    )
     generate_parser.add_argument(
         "--prompt-text",
         default=None,
@@ -258,6 +274,10 @@ def _run_generate_pytorch(args: argparse.Namespace) -> int:
         infer_argv.extend(["--prompt-text", args.prompt_text])
     if args.prompt_audio_path:
         infer_argv.extend(["--prompt-audio-path", args.prompt_audio_path])
+    elif args.reference_voice_gender == "female":
+        infer_argv.append("--female")
+    else:
+        infer_argv.append("--male")
     if args.seed is not None:
         infer_argv.extend(["--seed", str(args.seed)])
     if args.enable_wetext_processing:
@@ -314,6 +334,10 @@ def _run_generate_onnx(args: argparse.Namespace) -> int:
         infer_argv.extend(["--text-file", args.text_file])
     if args.prompt_audio_path:
         infer_argv.extend(["--prompt-audio-path", args.prompt_audio_path])
+    elif args.reference_voice_gender == "female":
+        infer_argv.append("--female")
+    else:
+        infer_argv.append("--male")
     if args.seed is not None:
         infer_argv.extend(["--seed", str(args.seed)])
     if args.enable_wetext_processing:

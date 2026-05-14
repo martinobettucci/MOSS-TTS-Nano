@@ -18,12 +18,7 @@ from moss_tts_nano.defaults import (
     DEFAULT_CHECKPOINT_PATH,
     DEFAULT_OUTPUT_DIR,
 )
-from text_normalization_pipeline import WeTextProcessingManager
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-from src.text_frontend import apply_harmonized_frontend
+from moss_tts_nano.reference_voices import resolve_reference_voice_path
 
 MOSS_AUDIO_TOKENIZER_TYPE = "moss-audio-tokenizer-nano"
 DEFAULT_AUDIO_TOKENIZER_PRETRAINED_NAME_OR_PATH = DEFAULT_AUDIO_TOKENIZER_PATH
@@ -105,6 +100,22 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--reference-audio-path",
         default=None,
         help="Compatibility alias for --prompt-audio-path.",
+    )
+    gender_group = parser.add_mutually_exclusive_group()
+    gender_group.add_argument(
+        "--male",
+        dest="reference_voice_gender",
+        action="store_const",
+        const="male",
+        default="male",
+        help="Use the bundled male reference voice when no prompt audio path is provided.",
+    )
+    gender_group.add_argument(
+        "--female",
+        dest="reference_voice_gender",
+        action="store_const",
+        const="female",
+        help="Use the bundled female reference voice when no prompt audio path is provided.",
     )
     parser.add_argument("--device", default="auto", help="Device to run on, for example auto/cpu/cuda/cuda:0.")
     parser.add_argument(
@@ -221,6 +232,20 @@ def resolve_prompt_text(args: argparse.Namespace) -> Optional[str]:
     if args.prompt_text_file is not None:
         return Path(args.prompt_text_file).read_text(encoding="utf-8")
     return None
+
+
+def resolve_prompt_audio_path(args: argparse.Namespace) -> str | None:
+    explicit_path = args.prompt_audio_path or args.reference_audio_path
+    if explicit_path:
+        return str(explicit_path)
+    if args.mode != "voice_clone":
+        return None
+    return str(
+        resolve_reference_voice_path(
+            language=args.lang,
+            gender=args.reference_voice_gender,
+        )
+    )
 
 
 def resolve_device(device_arg: str) -> torch.device:
@@ -438,38 +463,15 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
     sampling_kwargs = resolve_sampling_kwargs(args)
     raw_text = resolve_text(args)
     raw_prompt_text = resolve_prompt_text(args) or ""
-    enable_wetext_processing = bool(args.enable_wetext_processing) and not bool(args.disable_wetext_processing)
-    enable_normalize_tts_text = bool(args.enable_normalize_tts_text) and not bool(args.disable_normalize_tts_text)
-    text_normalizer_manager = None
-    if enable_wetext_processing:
-        text_normalizer_manager = WeTextProcessingManager()
-        snapshot = text_normalizer_manager.ensure_ready()
-        if not snapshot.ready:
-            if not snapshot.available:
-                logging.warning(
-                    "WeTextProcessing is not installed; falling back to robust text normalizer only."
-                )
-                enable_wetext_processing = False
-                text_normalizer_manager = None
-            else:
-                raise RuntimeError(snapshot.error or snapshot.message)
-        else:
-            logging.info("WeTextProcessing ready for infer.py status=%s", snapshot.message)
-    prepared_texts = apply_harmonized_frontend(
-        text=raw_text,
-        prompt_text=raw_prompt_text,
-        voice="",
-        language=args.lang,
-        enable_wetext=enable_wetext_processing,
-        enable_normalize_tts_text=enable_normalize_tts_text,
-        text_normalizer_manager=text_normalizer_manager,
-    )
-    text = str(prepared_texts["text"])
-    prompt_text = str(prepared_texts["prompt_text"]).strip() or None
+    # Engine handles text normalization (phoneme-ASCII or WeText) internally
+    # based on the checkpoint's `config.text_frontend_mode`. Clients only pass
+    # raw text + language.
+    text = str(raw_text)
+    prompt_text = str(raw_prompt_text).strip() or None
+    prompt_audio_path = resolve_prompt_audio_path(args)
     logging.info(
-        "text normalization method=%s language=%s text_chars=%d prompt_chars=%d",
-        prepared_texts["normalization_method"],
-        prepared_texts.get("text_normalization_language") or "n/a",
+        "passing raw text to engine language=%s text_chars=%d prompt_chars=%d",
+        args.lang or "n/a",
         len(text),
         len(prompt_text or ""),
     )
@@ -485,8 +487,8 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
         "output_audio_path": args.output_audio_path,
         "mode": args.mode,
         "prompt_text": prompt_text,
-        "prompt_audio_path": args.prompt_audio_path,
-        "reference_audio_path": args.reference_audio_path,
+        "prompt_audio_path": prompt_audio_path,
+        "reference_audio_path": None,
         "text_tokenizer_path": args.text_tokenizer_path or args.checkpoint,
         "audio_tokenizer": codec,
         "device": device,
