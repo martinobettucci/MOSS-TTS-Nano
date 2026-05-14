@@ -4,7 +4,8 @@ Checkpoint selection convention:
   0    -> base model (HuggingFace default, no fine-tuning)
   N    -> models/checkpoints/<lang>/final/checkpoint-epoch-N   (PyTorch)
            or  models/checkpoints/<lang>/final-onnx/checkpoint-epoch-N  (ONNX)
-  last -> checkpoint-last (latest saved epoch)
+  last -> checkpoint-best symlink if present (multistage training picks the
+          lowest-eval-score epoch), otherwise checkpoint-last (latest epoch).
 
 The base model ships with the default MOSS text tokenizer (en/zh). Finetuned
 checkpoints bundle the phoneme-aware tokenizer. So the resolver falls back to
@@ -81,9 +82,17 @@ def resolve_pytorch_checkpoint(
         )
 
     if checkpoint_spec == "last":
+        # Multistage training writes a `checkpoint-best` symlink pointing to the
+        # epoch with the lowest eval score. Prefer it when present; otherwise
+        # fall back to the latest saved checkpoint as before.
+        best_path = final_dir / "checkpoint-best"
+        if best_path.is_dir() or best_path.is_symlink():
+            return str(best_path)
         path = final_dir / "checkpoint-last"
         if not path.is_dir():
-            raise FileNotFoundError(f"checkpoint-last not found under {final_dir}.")
+            raise FileNotFoundError(
+                f"Neither checkpoint-best nor checkpoint-last found under {final_dir}."
+            )
         return str(path)
 
     try:
