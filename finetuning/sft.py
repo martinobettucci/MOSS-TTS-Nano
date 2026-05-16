@@ -90,6 +90,8 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--scheduler-step-offset", type=int, default=0)
+    parser.add_argument("--trainable-params", type=str, default="")
     parser.add_argument("--checkpoint-epoch-offset", type=int, default=0)
     return parser.parse_args()
 
@@ -451,6 +453,24 @@ def main() -> None:
     if hasattr(model, "_set_attention_implementation"):
         model._set_attention_implementation(attn_implementation)
 
+    if str(getattr(args, 'trainable_params', '') or '').strip():
+        _moss_prefixes = tuple(
+            piece.strip() for piece in str(args.trainable_params).split(',') if piece.strip()
+        )
+        if _moss_prefixes:
+            _moss_trainable_count = 0
+            _moss_total = 0
+            for _moss_name, _moss_param in model.named_parameters():
+                _moss_total += 1
+                if any(_moss_name.startswith(_p) for _p in _moss_prefixes):
+                    _moss_param.requires_grad = True
+                    _moss_trainable_count += 1
+                else:
+                    _moss_param.requires_grad = False
+            accelerator.print(
+                f'[{format_timestamp()}] [sft] trainable_params restricted: '
+                f'{_moss_trainable_count}/{_moss_total} params match {_moss_prefixes}'
+            )
     dataset = MossTTSNanoSFTDataset(
         records,
         tokenizer=tokenizer,
@@ -492,6 +512,14 @@ def main() -> None:
         lr_scheduler,
     )
 
+    _moss_sched_offset = int(getattr(args, 'scheduler_step_offset', 0) or 0)
+    if _moss_sched_offset > 0:
+        for _ in range(_moss_sched_offset):
+            lr_scheduler.step()
+        accelerator.print(
+            f'[{format_timestamp()}] [sft] scheduler fast-forwarded by '
+            f'{_moss_sched_offset} steps; lr={lr_scheduler.get_last_lr()[0]:.2e}'
+        )
     output_root = Path(args.output_dir)
     if accelerator.is_main_process:
         output_root.mkdir(parents=True, exist_ok=True)
