@@ -510,6 +510,7 @@ def _render_index_html_onnx(
     demo_entries,
     warmup_status: str,
     text_normalization_status: str,
+    language: str | None = None,
 ) -> str:
     html = _LEGACY_RENDER_INDEX_HTML(
         request=request,
@@ -517,30 +518,31 @@ def _render_index_html_onnx(
         demo_entries=demo_entries,
         warmup_status=warmup_status,
         text_normalization_status=text_normalization_status,
+        language=language,
     )
-    html = html.replace("MOSS-TTS-Nano Demo", "MOSS-TTS-Nano ONNX Demo")
+    html = html.replace("Démo MOSS-TTS-Nano", "Démo MOSS-TTS-Nano ONNX")
     html = html.replace(
-        '<label for="attn-implementation">Attention Backend</label>\n'
+        '<label for="attn-implementation">Implémentation d\'attention</label>\n'
         '              <select id="attn-implementation">\n'
         '                <option value="model_default">model_default</option>\n'
         '                <option value="sdpa">sdpa</option>\n'
         '                <option value="eager">eager</option>\n'
         '              </select>',
-        '<label for="attn-implementation">Sampling Mode</label>\n'
+        '<label for="attn-implementation">Mode d\'échantillonnage</label>\n'
         '              <select id="attn-implementation">\n'
         '                <option value="fixed">fixed</option>\n'
         '                <option value="full">full</option>\n'
         '                <option value="greedy">greedy</option>\n'
         '              </select>\n'
-        '              <div id="onnx-sampling-mode-note" class="meta">fixed uses the baked ONNX sampling constants.</div>',
+        '              <div id="onnx-sampling-mode-note" class="meta">« fixed » utilise les constantes d\'échantillonnage figées dans le modèle ONNX.</div>',
     )
     html = html.replace(
-        '<label><input id="do-sample" type="checkbox" checked> Do Sample</label>',
-        '<label><input id="do-sample" type="checkbox" checked disabled> Do Sample (derived from Sampling Mode)</label>',
+        '<label><input id="do-sample" type="checkbox" checked> Activer l\'échantillonnage</label>',
+        '<label><input id="do-sample" type="checkbox" checked disabled> Activer l\'échantillonnage (déduit du mode d\'échantillonnage)</label>',
     )
     html = html.replace(
-        'This app is CPU-only. CPU Threads maps to torch.set_num_threads for that request.',
-        'This ONNX app uses the server-start execution provider. CPU Threads selects the cached ONNX runtime instance for that request.',
+        'Application CPU uniquement. « Threads CPU » correspond à torch.set_num_threads pour la requête.',
+        'Cette application ONNX utilise l\'execution provider configuré au démarrage. « Threads CPU » sélectionne l\'instance ONNX mise en cache pour la requête.',
     )
     html = html.replace(
         '</style>',
@@ -584,11 +586,11 @@ def _render_index_html_onnx(
         '      }\n'
         '      if (onnxSamplingModeNote) {\n'
         '        if (mode === "full") {\n'
-        '          onnxSamplingModeNote.textContent = "full uses the current page sampling hyperparameters.";\n'
+        '          onnxSamplingModeNote.textContent = "« full » utilise les hyperparamètres d\'échantillonnage de la page courante.";\n'
         '        } else if (mode === "fixed") {\n'
-        '          onnxSamplingModeNote.textContent = "fixed uses the baked ONNX sampling constants and ignores the hyperparameter inputs below.";\n'
+        '          onnxSamplingModeNote.textContent = "« fixed » utilise les constantes d\'échantillonnage figées dans le modèle ONNX et ignore les hyperparamètres ci-dessous.";\n'
         '        } else {\n'
-        '          onnxSamplingModeNote.textContent = "greedy disables sampling and ignores the hyperparameter inputs below.";\n'
+        '          onnxSamplingModeNote.textContent = "« greedy » désactive l\'échantillonnage et ignore les hyperparamètres ci-dessous.";\n'
         '        }\n'
         '      }\n'
         '    }\n'
@@ -602,7 +604,7 @@ def _render_index_html_onnx(
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="MOSS-TTS-Nano ONNX web demo")
+    parser = argparse.ArgumentParser(description="Démo web MOSS-TTS-Nano ONNX")
     parser.add_argument(
         "--model-dir",
         default=None,
@@ -655,6 +657,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     warmup_manager = legacy_app.WarmupManager(runtime, text_normalizer_manager=text_normalizer_manager)
     warmup_manager.start()
 
+    logging.info("Préchauffage synchrone du modèle ONNX et du service de streaming avant le démarrage HTTP…")
+    warmup_snapshot = warmup_manager.ensure_ready()
+    if warmup_snapshot.failed:
+        raise SystemExit(
+            f"Échec du préchauffage ONNX : {warmup_snapshot.error or warmup_snapshot.message}"
+        )
+    logging.info("Préchauffage ONNX terminé : %s", warmup_snapshot.message)
+
     OnnxRequestRuntimeManager._factory_model_dir = runtime.model_dir
     OnnxRequestRuntimeManager._factory_output_dir = output_dir
     OnnxRequestRuntimeManager._factory_max_new_frames = int(args.max_new_frames)
@@ -671,7 +681,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         logging.warning("--share is ignored by the FastAPI-based ONNX app.")
 
     app = legacy_app._build_app(runtime, warmup_manager, text_normalizer_manager, root_path, language=args.lang)
-    app.title = "MOSS-TTS-Nano ONNX Demo"
+    app.title = "Démo MOSS-TTS-Nano ONNX"
     uvicorn.run(
         app,
         host=args.host,

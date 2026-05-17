@@ -45,7 +45,7 @@ class WeTextProcessingManager:
         self._thread: threading.Thread | None = None
         self._started = False
         self._state = "pending"
-        self._message = "Waiting for WeTextProcessing preload."
+        self._message = "En attente du préchargement de WeTextProcessing."
         self._error: str | None = None
         self._available = _WETEXT_AVAILABLE
         self._normalizers: dict[str, object] | None = None
@@ -92,17 +92,17 @@ class WeTextProcessingManager:
         if not self._available:
             self._set_state(
                 state="failed",
-                message="WeTextProcessing unavailable.",
+                message="WeTextProcessing indisponible.",
                 error="installed WeTextProcessing modules are unavailable",
             )
             return
         try:
-            self._set_state(state="running", message="Loading WeTextProcessing graphs.", error=None)
+            self._set_state(state="running", message="Chargement des graphes WeTextProcessing.", error=None)
             self._ensure_normalizers_loaded()
-            self._set_state(state="ready", message="WeTextProcessing ready. languages=zh,en", error=None)
+            self._set_state(state="ready", message="WeTextProcessing prêt. langues=zh,en", error=None)
         except Exception as exc:
             logging.exception("WeTextProcessing preload failed")
-            self._set_state(state="failed", message="WeTextProcessing preload failed.", error=str(exc))
+            self._set_state(state="failed", message="Échec du préchargement WeTextProcessing.", error=str(exc))
 
     def _ensure_normalizers_loaded(self) -> dict[str, object]:
         with self._lock:

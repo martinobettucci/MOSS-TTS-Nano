@@ -34,6 +34,7 @@ from moss_tts_nano_runtime import (
 from text_normalization_pipeline import (
     TextNormalizationSnapshot as SharedTextNormalizationSnapshot,
     WeTextProcessingManager as SharedWeTextProcessingManager,
+    prepare_tts_request_texts,
 )
 
 
@@ -164,7 +165,7 @@ class WarmupManager:
         self._started = False
         self._state = "pending"
         self._progress = 0.0
-        self._message = "Waiting for startup warmup."
+        self._message = "En attente du préchauffage de démarrage."
         self._error: str | None = None
 
     def start(self) -> None:
@@ -214,16 +215,16 @@ class WarmupManager:
 
     def _run(self) -> None:
         try:
-            self._set_state(state="running", progress=0.1, message="Loading Nano-TTS model.", error=None)
+            self._set_state(state="running", progress=0.1, message="Chargement du modèle Nano-TTS.", error=None)
             self.runtime.get_model()
-            self._set_state(state="running", progress=0.6, message="Running startup warmup synthesis.", error=None)
+            self._set_state(state="running", progress=0.6, message="Synthèse de préchauffage en cours.", error=None)
             result = self.runtime.warmup()
             _maybe_delete_file(result["audio_path"])
             if self.text_normalizer_manager is not None:
                 self._set_state(
                     state="running",
                     progress=0.85,
-                    message="Loading WeTextProcessing text normalization.",
+                    message="Chargement de la normalisation WeTextProcessing.",
                     error=None,
                 )
                 normalization_snapshot = self.text_normalizer_manager.ensure_ready()
@@ -237,15 +238,15 @@ class WarmupManager:
                 state="ready",
                 progress=1.0,
                 message=(
-                    f"Warmup complete. device={self.runtime.device} "
-                    f"elapsed={result['elapsed_seconds']:.2f}s"
-                    + (" | WeTextProcessing ready." if self.text_normalizer_manager is not None else "")
+                    f"Préchauffage terminé. device={self.runtime.device} "
+                    f"durée={result['elapsed_seconds']:.2f}s"
+                    + (" | WeTextProcessing prêt." if self.text_normalizer_manager is not None else "")
                 ),
                 error=None,
             )
         except Exception as exc:
             logging.exception("Nano-TTS warmup failed")
-            self._set_state(state="failed", progress=1.0, message="Warmup failed.", error=str(exc))
+            self._set_state(state="failed", progress=1.0, message="Échec du préchauffage.", error=str(exc))
 
 
 T = TypeVar("T")
@@ -461,10 +462,10 @@ class StreamingJobManager:
 def _warmup_status_text(snapshot: WarmupSnapshot) -> str:
     progress_pct = int(round(snapshot.progress * 100.0))
     if snapshot.failed:
-        return f"Warmup failed: {snapshot.error or snapshot.message}"
+        return f"Échec du préchauffage : {snapshot.error or snapshot.message}"
     if snapshot.ready:
         return snapshot.message
-    return f"Warmup in progress ({progress_pct}%): {snapshot.message}"
+    return f"Préchauffage en cours ({progress_pct}%) : {snapshot.message}"
 
 
 def _format_run_status(result: dict[str, object]) -> str:
@@ -498,19 +499,19 @@ def _format_run_status(result: dict[str, object]) -> str:
     elif prompt_audio_path:
         speaker_summary = f"prompt={Path(prompt_audio_path).stem}"
     return (
-        f"Done | mode={result['mode']} | {speaker_summary} | "
-        f"attn={attn_summary}{batch_summary}{execution_summary} | audio={audio_seconds:.2f}s | elapsed={float(result['elapsed_seconds']):.2f}s"
+        f"Terminé | mode={result['mode']} | {speaker_summary} | "
+        f"attn={attn_summary}{batch_summary}{execution_summary} | audio={audio_seconds:.2f}s | durée={float(result['elapsed_seconds']):.2f}s"
     )
 
 
 def _format_stream_status(snapshot: dict[str, object]) -> str:
     if bool(snapshot.get("failed")):
-        return f"Stream failed: {snapshot.get('error') or snapshot.get('run_status') or 'Unknown error'}"
+        return f"Échec du flux : {snapshot.get('error') or snapshot.get('run_status') or 'Erreur inconnue'}"
     if bool(snapshot.get("ready")):
-        return str(snapshot.get("run_status") or "Stream complete.")
+        return str(snapshot.get("run_status") or "Flux terminé.")
     if bool(snapshot.get("closed")):
-        return "Stream closed."
-    return str(snapshot.get("run_status") or "Streaming...")
+        return "Flux fermé."
+    return str(snapshot.get("run_status") or "Diffusion en cours…")
 
 
 def _normalize_stream_chunk_index(
@@ -666,7 +667,7 @@ def _format_blocking_metrics_text(
     wer: float,
 ) -> str:
     parts = [
-        f"gen={generation_time_sec:.2f}s",
+        f"durée={generation_time_sec:.2f}s",
         f"audio={audio_duration_sec:.2f}s",
         f"RTF={rtf:.3f}" + (" ✓" if 0 < rtf < 0.5 else (" ✗" if rtf >= 0 else "")),
         f"MOS~{mos_proxy:.2f}" + (" ✓" if mos_proxy > 3.0 else (" ✗" if mos_proxy > 0 else "")),
@@ -737,6 +738,59 @@ async def _persist_uploaded_prompt_audio(upload: UploadFile | None) -> tuple[str
     return temp_path, _format_uploaded_prompt_display_name(original_filename)
 
 
+_DEMO_FLAG_LANGUAGE_CODES: dict[str, set[str]] = {
+    "🇨🇳": {"zh"},
+    "🇺🇸": {"en"},
+    "🇬🇧": {"en"},
+    "🇯🇵": {"ja"},
+    "🇰🇷": {"ko"},
+    "🇪🇸": {"es"},
+    "🇫🇷": {"fr"},
+    "🇩🇪": {"de"},
+    "🇮🇹": {"it"},
+    "🇭🇺": {"hu"},
+    "🇷🇺": {"ru"},
+    "🇮🇷": {"fa"},
+    "🇸🇦": {"ar"},
+    "🇵🇱": {"pl"},
+    "🇵🇹": {"pt", "pt-pt"},
+    "🇧🇷": {"pt-br"},
+    "🇨🇿": {"cs"},
+    "🇩🇰": {"da"},
+    "🇸🇪": {"sv"},
+    "🇬🇷": {"el"},
+    "🇹🇷": {"tr"},
+    "🇳🇱": {"nl"},
+    "🇳🇴": {"no", "nb"},
+    "🇫🇮": {"fi"},
+    "🇷🇴": {"ro"},
+}
+
+
+def _demo_language_codes(name: str) -> set[str]:
+    haystack = str(name or "")
+    codes: set[str] = set()
+    for emoji, emoji_codes in _DEMO_FLAG_LANGUAGE_CODES.items():
+        if emoji in haystack:
+            codes |= emoji_codes
+    return codes
+
+
+def _demo_is_allowed_for_language(demo_entry: DemoEntry, language: str | None) -> bool:
+    if not language:
+        return True
+    normalized = str(language).strip().lower()
+    if not normalized:
+        return True
+    codes = _demo_language_codes(demo_entry.name)
+    if not codes:
+        return False
+    if normalized in codes:
+        return True
+    base = normalized.split("-", 1)[0]
+    return base in codes
+
+
 def _render_index_html(
     *,
     request: Request,
@@ -744,15 +798,16 @@ def _render_index_html(
     demo_entries: list[DemoEntry],
     warmup_status: str,
     text_normalization_status: str,
+    language: str | None = None,
 ) -> str:
     base_path = request.scope.get("root_path", "").rstrip("/")
     template = """
 <!doctype html>
-<html lang="en">
+<html lang="fr">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MOSS-TTS-Nano Demo</title>
+  <title>Démo MOSS-TTS-Nano</title>
   <style>
     :root {
       color-scheme: light;
@@ -1128,80 +1183,81 @@ def _render_index_html(
 <body>
   <div class="page">
     <div class="hero">
-      <h1>MOSS-TTS-Nano Demo</h1>
-      <p class="lead">State-of-the-art text-to-speech demo for multilingual voice cloning.</p>
+      <h1>Démo MOSS-TTS-Nano</h1>
+      <p class="lead">Démo de synthèse vocale de pointe pour le clonage de voix multilingue.</p>
       <ul class="hero-points">
-        <li><strong>Voice Clone</strong> - Clone any voice from a reference audio.</li>
-        <li><strong>Voice Presets</strong> - Choose built-in demos from <code>assets/demo.jsonl</code>.</li>
+        <li><strong>Clonage de voix</strong> - Clonez n'importe quelle voix depuis un audio de référence.</li>
+        <li><strong>Préréglages de voix</strong> - Sélectionnez les démos intégrées depuis <code>assets/demo.jsonl</code>.</li>
       </ul>
-      <p class="build-note">Built with <a href="https://github.com/OpenMOSS/MOSS-TTS-Nano" target="_blank" rel="noopener noreferrer">MOSS-TTS-Nano</a>.</p>
-      <div class="top-tabs" role="tablist" aria-label="Demo mode">
-        <button class="top-tab active" type="button" aria-selected="true">Voice Clone</button>
+      <p class="build-note">Conçu avec <a href="https://github.com/OpenMOSS/MOSS-TTS-Nano" target="_blank" rel="noopener noreferrer">MOSS-TTS-Nano</a>.</p>
+      <div class="top-tabs" role="tablist" aria-label="Mode de démo">
+        <button class="top-tab active" type="button" aria-selected="true">Clonage de voix</button>
       </div>
     </div>
 
     <div class="grid">
       <div class="panel input-panel">
         <div class="field">
-          <label for="demo">Demo</label>
+          <label for="demo">Démo</label>
           <select id="demo"></select>
+          <div id="demo-language-note" class="meta" hidden></div>
         </div>
 
         <div class="field">
-          <label for="prompt-audio-upload">Prompt Speech</label>
+          <label for="prompt-audio-upload">Audio de référence</label>
           <div class="prompt-audio-box">
             <input id="prompt-audio-upload" type="file" accept="audio/*,.wav,.mp3,.flac,.m4a,.ogg,.opus,.aac">
             <audio id="prompt-audio-preview" controls hidden></audio>
-            <div id="prompt-audio-source" class="meta">Using the selected demo prompt speech.</div>
+            <div id="prompt-audio-source" class="meta">Utilisation de l'audio de démo sélectionné.</div>
             <div class="prompt-audio-actions">
-              <button id="choose-prompt-audio-btn" class="secondary" type="button" hidden>选择文件</button>
-              <button id="clear-prompt-audio-btn" class="secondary" type="button" hidden>使用 Demo 音频</button>
+              <button id="choose-prompt-audio-btn" class="secondary" type="button" hidden>Choisir un fichier</button>
+              <button id="clear-prompt-audio-btn" class="secondary" type="button" hidden>Utiliser l'audio de démo</button>
             </div>
           </div>
         </div>
 
         <div class="field">
-          <label for="text">Text</label>
-          <textarea id="text" placeholder="Enter the text you want to synthesize..."></textarea>
+          <label for="text">Texte</label>
+          <textarea id="text" placeholder="Saisissez le texte à synthétiser…"></textarea>
         </div>
 
         <details>
-          <summary>Generation Options</summary>
+          <summary>Options de génération</summary>
           <div class="row" style="margin-top: 12px;">
             <div class="field">
-              <label for="max-new-frames">Max New Frames</label>
+              <label for="max-new-frames">Trames maximales</label>
               <input id="max-new-frames" type="number" min="64" max="1024" step="1" value="375">
             </div>
             <div class="field">
-              <label for="voice-clone-max-text-tokens">Voice Clone Max Text Tokens</label>
-              <input id="voice-clone-max-text-tokens" type="number" min="0" max="200" step="1" value="0" title="0 = use checkpoint's training-distribution recommendation">
+              <label for="voice-clone-max-text-tokens">Tokens texte max (clonage)</label>
+              <input id="voice-clone-max-text-tokens" type="number" min="0" max="200" step="1" value="0" title="0 = utilise la recommandation issue de la distribution d'entraînement du checkpoint">
             </div>
           </div>
           <div class="row">
             <div class="field">
-              <label for="tts-max-batch-size">Max TTS Batch Size (0=auto)</label>
+              <label for="tts-max-batch-size">Lot TTS max (0=auto)</label>
               <input id="tts-max-batch-size" type="number" min="0" step="1" value="1">
             </div>
             <div class="field">
-              <label for="codec-max-batch-size">Max Codec Batch Size (0=auto)</label>
+              <label for="codec-max-batch-size">Lot codec max (0=auto)</label>
               <input id="codec-max-batch-size" type="number" min="0" step="1" value="0">
             </div>
           </div>
           <div class="meta">
-            0 keeps the current default behavior. Set Max TTS Batch Size to 1 to force split chunks to run one by one.
-            Buffered generation keeps chunk order and decodes codec sub-batches no larger than the current TTS batch.
-            Realtime Streaming Decode keeps output order and uses the smallest active chunk-group width among auto batching, Max TTS Batch Size, and Max Codec Batch Size.
+            0 conserve le comportement par défaut. Réglez « Lot TTS max » à 1 pour forcer l'exécution séquentielle des fragments.
+            La génération bufferisée préserve l'ordre des fragments et décode des sous-lots du codec sans dépasser la taille du lot TTS courant.
+            Le décodage en streaming temps réel préserve l'ordre et utilise la plus petite largeur de groupe parmi le batching automatique, « Lot TTS max » et « Lot codec max ».
           </div>
           <div class="field">
-            <label for="cpu-thread-count">CPU Threads</label>
+            <label for="cpu-thread-count">Threads CPU</label>
             <input id="cpu-thread-count" type="number" min="1" step="1" value="4">
           </div>
           <div class="meta">
-            This app is CPU-only. CPU Threads maps to torch.set_num_threads for that request.
+            Application CPU uniquement. « Threads CPU » correspond à torch.set_num_threads pour la requête.
           </div>
           <div class="row">
             <div class="field">
-              <label for="attn-implementation">Attention Backend</label>
+              <label for="attn-implementation">Implémentation d'attention</label>
               <select id="attn-implementation">
                 <option value="model_default">model_default</option>
                 <option value="sdpa">sdpa</option>
@@ -1209,115 +1265,115 @@ def _render_index_html(
               </select>
             </div>
             <div class="field">
-              <label for="seed">Seed</label>
+              <label for="seed">Graine</label>
               <input id="seed" type="number" step="1" value="0">
             </div>
           </div>
           <div class="row">
             <div class="field">
-              <label for="text-temperature">Text Temperature</label>
+              <label for="text-temperature">Température texte</label>
               <input id="text-temperature" type="number" min="0.1" max="2.0" step="0.05" value="1.0">
             </div>
             <div class="field">
-              <label for="text-top-p">Text Top P</label>
+              <label for="text-top-p">Top P texte</label>
               <input id="text-top-p" type="number" min="0.1" max="1.0" step="0.05" value="1.0">
             </div>
           </div>
           <div class="row">
             <div class="field">
-              <label for="text-top-k">Text Top K</label>
+              <label for="text-top-k">Top K texte</label>
               <input id="text-top-k" type="number" min="1" max="100" step="1" value="50">
             </div>
             <div class="field">
-              <label for="audio-temperature">Audio Temperature</label>
+              <label for="audio-temperature">Température audio</label>
               <input id="audio-temperature" type="number" min="0.1" max="2.0" step="0.05" value="0.8">
             </div>
           </div>
           <div class="row">
             <div class="field">
-              <label for="audio-top-p">Audio Top P</label>
+              <label for="audio-top-p">Top P audio</label>
               <input id="audio-top-p" type="number" min="0.1" max="1.0" step="0.05" value="0.95">
             </div>
             <div class="field">
-              <label for="audio-top-k">Audio Top K</label>
+              <label for="audio-top-k">Top K audio</label>
               <input id="audio-top-k" type="number" min="1" max="100" step="1" value="25">
             </div>
           </div>
           <div class="row">
             <div class="field">
-              <label for="audio-repetition-penalty">Audio Repetition Penalty</label>
+              <label for="audio-repetition-penalty">Pénalité de répétition audio</label>
               <input id="audio-repetition-penalty" type="number" min="1.0" max="2.0" step="0.05" value="1.2">
             </div>
             <div class="field"></div>
           </div>
           <div class="field">
-            <label><input id="do-sample" type="checkbox" checked> Do Sample</label>
+            <label><input id="do-sample" type="checkbox" checked> Activer l'échantillonnage</label>
           </div>
           <div class="field">
-            <label><input id="enable-text-normalization" type="checkbox" checked> Enable WeTextProcessing</label>
+            <label><input id="enable-text-normalization" type="checkbox" checked> Activer WeTextProcessing</label>
           </div>
           <div class="field">
-            <label><input id="enable-robust-text-normalization" type="checkbox" checked> Enable normalize_tts_text</label>
+            <label><input id="enable-robust-text-normalization" type="checkbox" checked> Activer normalize_tts_text</label>
           </div>
           <div class="meta">
-            WeTextProcessing and normalize_tts_text can now be toggled independently for each request.
-            WeTextProcessing is preloaded during startup so enabling it does not add first-request graph-build latency.
+            WeTextProcessing et normalize_tts_text peuvent être activés indépendamment pour chaque requête.
+            WeTextProcessing est préchargé au démarrage, son activation n'ajoute donc pas de latence de construction du graphe à la première requête.
           </div>
           <div class="row">
             <div class="field">
-              <label><input id="eval-wer" type="checkbox"> Compute WER <span class="meta">(slow, needs jiwer)</span></label>
+              <label><input id="eval-wer" type="checkbox"> Calculer WER <span class="meta">(lent, requiert jiwer)</span></label>
             </div>
             <div class="field">
-              <label><input id="eval-mos" type="checkbox"> Compute UTMOS <span class="meta">(slow, needs speechmos)</span></label>
+              <label><input id="eval-mos" type="checkbox"> Calculer UTMOS <span class="meta">(lent, requiert speechmos)</span></label>
             </div>
           </div>
           <div class="row">
             <div class="field">
-              <label><input id="realtime-stream" type="checkbox" checked> Realtime Streaming Decode</label>
+              <label><input id="realtime-stream" type="checkbox" checked> Décodage en streaming temps réel</label>
             </div>
             <div class="field">
-              <label for="initial-playback-delay-seconds">Initial Playback Delay (s)</label>
+              <label for="initial-playback-delay-seconds">Délai initial de lecture (s)</label>
               <input id="initial-playback-delay-seconds" type="number" min="0.00" step="0.01" value="0.08">
             </div>
           </div>
         </details>
 
         <div class="buttons">
-          <button id="generate-btn" type="button">Generate</button>
-          <button id="pause-btn" class="secondary" type="button" disabled>Pause Playback</button>
-          <button id="refresh-btn" class="secondary" type="button">Refresh Warmup Status</button>
+          <button id="generate-btn" type="button">Générer</button>
+          <button id="pause-btn" class="secondary" type="button" disabled>Mettre en pause</button>
+          <button id="refresh-btn" class="secondary" type="button">Actualiser le préchauffage</button>
         </div>
       </div>
 
       <div class="panel output-panel">
         <div class="field">
-          <label class="field-tag">Warmup Status</label>
+          <label class="field-tag">État du préchauffage</label>
           <div id="warmup-status" class="status">__WARMUP_STATUS__</div>
         </div>
         <div class="field">
-          <label class="field-tag">Text Normalization Status</label>
+          <label class="field-tag">État de la normalisation</label>
           <div id="text-normalization-status" class="status">__TEXT_NORMALIZATION_STATUS__</div>
         </div>
         <div class="field">
-          <label class="field-tag">Run Status</label>
-          <div id="run-status" class="status">Idle.</div>
+          <label class="field-tag">État d'exécution</label>
+          <div id="run-status" class="status">Inactif.</div>
         </div>
         <div id="stream-metrics" class="meta"></div>
         <div class="field">
-          <label class="field-tag">Normalized Text</label>
+          <label class="field-tag">Texte normalisé</label>
           <textarea id="normalized-text-output" readonly style="min-height: 120px;"></textarea>
         </div>
         <div class="field">
-          <label class="field-tag">Playback Script</label>
-          <div id="playback-script" class="playback-script empty">The current sentence will be highlighted here during playback.</div>
+          <label class="field-tag">Script de lecture</label>
+          <div id="playback-script" class="playback-script empty">La phrase en cours de lecture sera surlignée ici.</div>
         </div>
         <div class="field">
-          <label class="field-tag">Generated Speech</label>
+          <label class="field-tag">Audio généré</label>
           <div id="resolved-prompt" class="meta"></div>
         </div>
         <audio id="audio-output" controls></audio>
-        <div class="meta">Checkpoint: __CHECKPOINT__</div>
-        <div class="meta">Audio Tokenizer: __AUDIO_TOKENIZER__</div>
+        <div class="meta">Point de contrôle : __CHECKPOINT__</div>
+        <div class="meta">Tokenizer audio : __AUDIO_TOKENIZER__</div>
       </div>
     </div>
   </div>
@@ -1328,6 +1384,8 @@ def _render_index_html(
     const DEFAULT_DEMO_ID = __DEFAULT_DEMO_ID__;
     const DEFAULT_ATTN_IMPLEMENTATION = __DEFAULT_ATTN_IMPLEMENTATION__;
     const DEFAULT_CPU_THREADS = __DEFAULT_CPU_THREADS__;
+    const APP_LANGUAGE = __APP_LANGUAGE__;
+    const ALLOWED_DEMO_IDS = __ALLOWED_DEMO_IDS__;
 
     const demoSelect = document.getElementById("demo");
     const promptAudioUploadInput = document.getElementById("prompt-audio-upload");
@@ -1368,16 +1426,38 @@ def _render_index_html(
     let currentRealtimePlaybackScheduledAudioSeconds = 0;
     let currentRealtimePlaybackChunkRanges = [];
 
+    const allowedDemoIdSet = Array.isArray(ALLOWED_DEMO_IDS) ? new Set(ALLOWED_DEMO_IDS) : null;
+    function isDemoAllowed(demoId) {
+      if (!allowedDemoIdSet) return true;
+      return allowedDemoIdSet.has(demoId);
+    }
     const demosById = new Map();
+    let firstAllowedDemoId = null;
     for (const demo of DEMOS) {
       demosById.set(demo.id, demo);
       const option = document.createElement("option");
       option.value = demo.id;
       option.textContent = demo.name;
-      if (demo.id === DEFAULT_DEMO_ID) {
-        option.selected = true;
+      const allowed = isDemoAllowed(demo.id);
+      if (!allowed) {
+        option.disabled = true;
+      } else if (firstAllowedDemoId === null) {
+        firstAllowedDemoId = demo.id;
       }
       demoSelect.appendChild(option);
+    }
+    const initialSelectedDemoId = (DEFAULT_DEMO_ID && isDemoAllowed(DEFAULT_DEMO_ID))
+      ? DEFAULT_DEMO_ID
+      : firstAllowedDemoId;
+    if (initialSelectedDemoId) {
+      demoSelect.value = initialSelectedDemoId;
+    }
+    const demoLanguageNote = document.getElementById("demo-language-note");
+    if (demoLanguageNote && APP_LANGUAGE) {
+      demoLanguageNote.hidden = false;
+      demoLanguageNote.textContent =
+        "Démos restreintes à la langue : " + String(APP_LANGUAGE).toUpperCase()
+        + ". Les démos d'autres langues sont désactivées.";
     }
     document.getElementById("attn-implementation").value = DEFAULT_ATTN_IMPLEMENTATION;
 
@@ -1402,7 +1482,7 @@ def _render_index_html(
       return `${APP_BASE}/api/demo-prompt-audio/${encodeURIComponent(demoId)}`;
     }
 
-    function showPromptAudioFilePicker(message = "选择文件 | 未选择任何文件") {
+    function showPromptAudioFilePicker(message = "Choisir un fichier | Aucun fichier sélectionné") {
       promptAudioPreview.pause();
       promptAudioPreview.removeAttribute("src");
       promptAudioPreview.load();
@@ -1433,7 +1513,7 @@ def _render_index_html(
         currentPromptAudioPreviewUrl = URL.createObjectURL(uploadedPromptAudio);
         showPromptAudioPreview({
           sourceUrl: currentPromptAudioPreviewUrl,
-          message: `Using uploaded prompt speech: ${uploadedPromptAudio.name}`,
+          message: `Utilisation de l'audio téléversé : ${uploadedPromptAudio.name}`,
           showResetToDemo: true,
         });
         return;
@@ -1445,8 +1525,8 @@ def _render_index_html(
         showPromptAudioPreview({
           sourceUrl: getDemoPromptAudioUrl(demo.id),
           message: demo.prompt_speech
-            ? `Using demo prompt speech: ${demo.prompt_speech}`
-            : "Using demo prompt speech.",
+            ? `Utilisation de l'audio de démo : ${demo.prompt_speech}`
+            : "Utilisation de l'audio de démo.",
           showResetToDemo: false,
         });
         return;
@@ -1610,7 +1690,7 @@ def _render_index_html(
 
       if (!playbackChunks.length) {
         playbackScript.classList.add("empty");
-        playbackScript.textContent = "The current sentence will be highlighted here during playback.";
+        playbackScript.textContent = "La phrase en cours de lecture sera surlignée ici.";
         return;
       }
 
@@ -1675,16 +1755,16 @@ def _render_index_html(
     function updatePauseButtonState() {
       if (hasRealtimePlayback()) {
         pauseBtn.disabled = false;
-        pauseBtn.textContent = currentRealtimePlaybackPaused ? "Resume Playback" : "Pause Playback";
+        pauseBtn.textContent = currentRealtimePlaybackPaused ? "Reprendre la lecture" : "Mettre en pause";
         return;
       }
       if (hasBufferedPlayback()) {
         pauseBtn.disabled = false;
-        pauseBtn.textContent = audioOutput.paused ? "Resume Playback" : "Pause Playback";
+        pauseBtn.textContent = audioOutput.paused ? "Reprendre la lecture" : "Mettre en pause";
         return;
       }
       pauseBtn.disabled = true;
-      pauseBtn.textContent = "Pause Playback";
+      pauseBtn.textContent = "Mettre en pause";
     }
 
     function resetRealtimePlaybackTracking() {
@@ -1942,10 +2022,10 @@ def _render_index_html(
           fetchJson(`${APP_BASE}/api/warmup-status`),
           fetchJson(`${APP_BASE}/api/text-normalization-status`),
         ]);
-        setStatus(warmupStatus, warmupData.status_text || "Unknown status.");
+        setStatus(warmupStatus, warmupData.status_text || "État inconnu.");
         setStatus(
           textNormalizationStatus,
-          normalizationData.status_text || "Unknown status.",
+          normalizationData.status_text || "État inconnu.",
           Boolean(normalizationData.failed)
         );
       } catch (error) {
@@ -1971,8 +2051,8 @@ def _render_index_html(
       rebuildBufferedPlaybackBoundaries();
       updateBufferedPlaybackHighlight();
       updatePauseButtonState();
-      resolvedPrompt.textContent = "Generated speech is ready.";
-      setStatus(runStatus, data.run_status || "Done.");
+      resolvedPrompt.textContent = "L'audio généré est prêt.";
+      setStatus(runStatus, data.run_status || "Terminé.");
       if (data.metrics_text) {
         streamMetrics.textContent = data.metrics_text;
       }
@@ -1987,7 +2067,7 @@ def _render_index_html(
     async function generateRealtime(formData) {
       await closeRealtimeStream();
       clearAudioOutput();
-      resolvedPrompt.textContent = "Generating realtime speech...";
+      resolvedPrompt.textContent = "Génération en temps réel…";
       streamMetrics.textContent = "";
 
       const startData = await fetchJson(`${APP_BASE}/api/generate-stream/start`, {
@@ -1996,7 +2076,7 @@ def _render_index_html(
       });
 
       currentStreamId = startData.stream_id;
-      setStatus(runStatus, startData.run_status || "Streaming realtime audio...");
+      setStatus(runStatus, startData.run_status || "Diffusion audio en temps réel…");
       if (startData.warmup_status_text) {
         setStatus(warmupStatus, startData.warmup_status_text);
       }
@@ -2008,7 +2088,7 @@ def _render_index_html(
 
       const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
       if (!AudioContextCtor) {
-        throw new Error("This browser does not support Web Audio streaming playback.");
+        throw new Error("Ce navigateur ne prend pas en charge la lecture Web Audio en streaming.");
       }
       currentInitialPlaybackDelaySeconds = resolveInitialPlaybackDelaySeconds();
       currentAudioContext = new AudioContextCtor({ sampleRate: startData.sample_rate });
@@ -2029,13 +2109,13 @@ def _render_index_html(
           setStatus(runStatus, snapshot.run_status, Boolean(snapshot.failed));
         }
         const metrics = [
-          `state=${snapshot.state}`,
-          `emitted=${Number(snapshot.emitted_audio_seconds || 0).toFixed(2)}s`,
-          `lead=${Number(snapshot.lead_seconds || 0).toFixed(2)}s`,
-          `playback_delay=${currentInitialPlaybackDelaySeconds.toFixed(2)}s`
+          `état=${snapshot.state}`,
+          `émis=${Number(snapshot.emitted_audio_seconds || 0).toFixed(2)}s`,
+          `avance=${Number(snapshot.lead_seconds || 0).toFixed(2)}s`,
+          `délai_lecture=${currentInitialPlaybackDelaySeconds.toFixed(2)}s`
         ];
         if (snapshot.first_audio_latency_seconds !== null && snapshot.first_audio_latency_seconds !== undefined) {
-          metrics.push(`first_audio=${Number(snapshot.first_audio_latency_seconds).toFixed(2)}s`);
+          metrics.push(`premier_audio=${Number(snapshot.first_audio_latency_seconds).toFixed(2)}s`);
         }
         streamMetrics.textContent = metrics.join(" | ");
         if (!currentRealtimePlaybackPaused && snapshot.playback_chunk_index !== null && snapshot.playback_chunk_index !== undefined) {
@@ -2057,7 +2137,7 @@ def _render_index_html(
         throw new Error(text || `HTTP ${response.status}`);
       }
       if (!response.body) {
-        throw new Error("ReadableStream is not available on this response.");
+        throw new Error("ReadableStream n'est pas disponible pour cette réponse.");
       }
 
       const reader = response.body.getReader();
@@ -2098,7 +2178,7 @@ def _render_index_html(
         await new Promise((resolve) => window.setTimeout(resolve, 100));
       }
       if (!result || !result.ready) {
-        throw new Error("Streaming finished but the final result is not ready yet.");
+        throw new Error("Diffusion terminée, mais le résultat final n'est pas encore prêt.");
       }
       if (result.audio_base64) {
         if (currentAudioObjectUrl) {
@@ -2111,14 +2191,14 @@ def _render_index_html(
         audioOutput.load();
         rebuildBufferedPlaybackBoundaries();
       }
-      resolvedPrompt.textContent = "Generated speech is ready.";
+      resolvedPrompt.textContent = "L'audio généré est prêt.";
       streamMetrics.textContent = result.stream_metrics || streamMetrics.textContent;
       if (Array.isArray(result.text_chunks) && result.text_chunks.length > 0 && playbackChunks.length === 0) {
         renderPlaybackScript(result.text_chunks, normalizedTextOutput.value || textInput.value);
       }
       currentRealtimePlaybackChunkRanges = normalizeRealtimeChunkRanges(result.audio_chunk_ranges);
       updateRealtimePlaybackHighlightFromLocalClock();
-      setStatus(runStatus, result.run_status || "Stream complete.");
+      setStatus(runStatus, result.run_status || "Flux terminé.");
       if (currentStreamId) {
         fetch(`${APP_BASE}/api/generate-stream/${encodeURIComponent(currentStreamId)}/close`, {
           method: "POST"
@@ -2156,7 +2236,7 @@ def _render_index_html(
     async function generate() {
       generateBtn.disabled = true;
       refreshBtn.disabled = true;
-      setStatus(runStatus, realtimeStreamToggle.checked ? "Starting realtime stream..." : "Running synthesis...");
+      setStatus(runStatus, realtimeStreamToggle.checked ? "Démarrage du flux temps réel…" : "Synthèse en cours…");
 
       try {
         const formData = buildFormData();
@@ -2187,13 +2267,13 @@ def _render_index_html(
       clearNormalizedOutputs();
       resolvedPrompt.textContent = "";
       streamMetrics.textContent = "";
-      setStatus(runStatus, "Idle.");
+      setStatus(runStatus, "Inactif.");
     });
     promptAudioUploadInput.addEventListener("change", () => {
       applySelectedDemo(false);
       clearNormalizedOutputs();
       resolvedPrompt.textContent = "";
-      setStatus(runStatus, "Idle.");
+      setStatus(runStatus, "Inactif.");
     });
     choosePromptAudioBtn.addEventListener("click", () => {
       promptAudioUploadInput.click();
@@ -2203,7 +2283,7 @@ def _render_index_html(
       applySelectedDemo(false);
       clearNormalizedOutputs();
       resolvedPrompt.textContent = "";
-      setStatus(runStatus, "Idle.");
+      setStatus(runStatus, "Inactif.");
     });
     pauseBtn.addEventListener("click", () => {
       togglePausePlayback().catch((error) => {
@@ -2247,12 +2327,27 @@ def _render_index_html(
         }
         for demo_entry in demo_entries
     ]
+    normalized_language = (str(language).strip().lower() if language else "")
+    if normalized_language:
+        allowed_demo_ids: list[str] | None = [
+            demo_entry.demo_id
+            for demo_entry in demo_entries
+            if _demo_is_allowed_for_language(demo_entry, normalized_language)
+        ]
+    else:
+        allowed_demo_ids = None
+    if allowed_demo_ids is not None and allowed_demo_ids:
+        default_demo_id = allowed_demo_ids[0]
+    else:
+        default_demo_id = demo_entries[0].demo_id if demo_entries else ""
     replacements = {
         "__APP_BASE__": json.dumps(base_path),
         "__DEMOS__": json.dumps(demos_payload, ensure_ascii=False),
-        "__DEFAULT_DEMO_ID__": json.dumps(demo_entries[0].demo_id if demo_entries else ""),
+        "__DEFAULT_DEMO_ID__": json.dumps(default_demo_id),
         "__DEFAULT_ATTN_IMPLEMENTATION__": json.dumps(runtime.attn_implementation or "model_default"),
         "__DEFAULT_CPU_THREADS__": json.dumps(max(1, int(os.cpu_count() or 1))),
+        "__APP_LANGUAGE__": json.dumps(normalized_language),
+        "__ALLOWED_DEMO_IDS__": json.dumps(allowed_demo_ids if allowed_demo_ids is not None else None),
         "__WARMUP_STATUS__": warmup_status,
         "__TEXT_NORMALIZATION_STATUS__": text_normalization_status,
         "__CHECKPOINT__": str(runtime.checkpoint_path),
@@ -2270,7 +2365,7 @@ def _build_app(
     root_path: str | None,
     language: str | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="MOSS-TTS-Nano Demo", root_path=root_path or "")
+    app = FastAPI(title="Démo MOSS-TTS-Nano", root_path=root_path or "")
     stream_jobs = StreamingJobManager()
     runtime_manager = RequestRuntimeManager(runtime)
     demo_entries = _load_demo_entries()
@@ -2340,13 +2435,13 @@ def _build_app(
 
     def _stream_metrics_text(snapshot: dict[str, object]) -> str:
         metrics = [
-            f"state={snapshot['state']}",
-            f"emitted={float(snapshot['emitted_audio_seconds']):.2f}s",
-            f"lead={float(snapshot['lead_seconds']):.2f}s",
+            f"état={snapshot['state']}",
+            f"émis={float(snapshot['emitted_audio_seconds']):.2f}s",
+            f"avance={float(snapshot['lead_seconds']):.2f}s",
         ]
         first_audio_latency = snapshot.get("first_audio_latency_seconds")
         if first_audio_latency is not None:
-            metrics.append(f"first_audio={float(first_audio_latency):.3f}s")
+            metrics.append(f"premier_audio={float(first_audio_latency):.3f}s")
         rtf = snapshot.get("rtf", -1.0)
         if rtf is not None and float(rtf) >= 0:
             rtf_v = float(rtf)
@@ -2359,7 +2454,7 @@ def _build_app(
 
     def _text_normalization_status_text(snapshot: SharedTextNormalizationSnapshot | None) -> str:
         if snapshot is None:
-            return "WeTextProcessing disabled."
+            return "WeTextProcessing désactivé."
         if snapshot.failed:
             return f"{snapshot.message} error={snapshot.error}"
         return snapshot.message
@@ -2411,7 +2506,7 @@ def _build_app(
             with job.lock:
                 job.started_at = time.monotonic()
                 job.state = "running"
-                job.run_status = f"Streaming realtime audio... exec={initial_execution_label}"
+                job.run_status = f"Diffusion audio en temps réel… exec={initial_execution_label}"
 
             def _stream_factory(selected_runtime: NanoTTSService):
                 return selected_runtime.synthesize_stream(
@@ -2480,7 +2575,7 @@ def _build_app(
                         if job.first_audio_at is None and not is_pause:
                             job.first_audio_at = time.monotonic()
                         job.run_status = (
-                            f"Streaming | emitted={job.emitted_audio_seconds:.2f}s | lead={job.lead_seconds:.2f}s"
+                            f"Diffusion | émis={job.emitted_audio_seconds:.2f}s | avance={job.lead_seconds:.2f}s"
                         )
                     _put_stream_audio(job, pcm_bytes)
                     continue
@@ -2517,7 +2612,7 @@ def _build_app(
                 job.state = "failed"
                 job.error = str(exc)
                 job.completed_at = time.monotonic()
-                job.run_status = f"Stream failed: {exc}"
+                job.run_status = f"Échec du flux : {exc}"
         finally:
             _maybe_delete_file(prompt_audio_cleanup_path)
             try:
@@ -2536,6 +2631,7 @@ def _build_app(
                 text_normalization_status=_text_normalization_status_text(
                     text_normalizer_manager.snapshot() if text_normalizer_manager is not None else None
                 ),
+                language=language,
             )
         )
 
@@ -2578,12 +2674,12 @@ def _build_app(
         if snapshot is None:
             return {
                 "state": "disabled",
-                "message": "WeTextProcessing disabled.",
+                "message": "WeTextProcessing désactivé.",
                 "error": None,
                 "ready": False,
                 "failed": False,
                 "available": False,
-                "status_text": "WeTextProcessing disabled.",
+                "status_text": "WeTextProcessing désactivé.",
             }
         return {
             "state": snapshot.state,
@@ -2658,6 +2754,14 @@ def _build_app(
             normalized_seed = None if seed in {"", "0"} else int(seed)
             # Engine normalizes raw text internally based on the checkpoint
             # (phoneme-ASCII or WeText). Clients pass `(text, language)` only.
+            prepared_texts = prepare_tts_request_texts(
+                text=resolved_text,
+                voice="",
+                language=language,
+                enable_wetext=_coerce_bool(enable_text_normalization, True),
+                enable_normalize_tts_text=_coerce_bool(enable_normalize_tts_text, True),
+                text_normalizer_manager=text_normalizer_manager,
+            )
             text_chunks = _resolve_voice_clone_text_chunks(
                 text=resolved_text,
                 voice_clone_max_text_tokens=int(voice_clone_max_text_tokens),
@@ -2706,7 +2810,7 @@ def _build_app(
                 "result_url": f"{app.root_path}/api/generate-stream/{job.stream_id}/result",
                 "sample_rate": job.sample_rate,
                 "channels": job.channels,
-                "run_status": f"Streaming realtime audio... exec={initial_execution_label}",
+                "run_status": f"Diffusion audio en temps réel… exec={initial_execution_label}",
                 "prompt_audio_path": prompt_audio_display_path,
                 "warmup_status_text": _warmup_status_text(warmup_manager.snapshot()),
                 "text_normalization_status_text": _text_normalization_status_text(
@@ -2863,6 +2967,15 @@ def _build_app(
         try:
             normalized_seed = None if seed in {"", "0"} else int(seed)
 
+            prepared_texts = prepare_tts_request_texts(
+                text=resolved_text,
+                voice="",
+                language=language,
+                enable_wetext=_coerce_bool(enable_text_normalization, True),
+                enable_normalize_tts_text=_coerce_bool(enable_normalize_tts_text, True),
+                text_normalizer_manager=text_normalizer_manager,
+            )
+
             # Engine normalizes raw text internally. Clients pass (text, language) only.
             def _synthesize(selected_runtime: NanoTTSService):
                 return selected_runtime.synthesize(
@@ -2959,7 +3072,7 @@ def _build_app(
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
-    parser = argparse.ArgumentParser(description="MOSS-TTS-Nano web demo")
+    parser = argparse.ArgumentParser(description="Démo web MOSS-TTS-Nano")
     parser.add_argument("--checkpoint-path", "--checkpoint_path", dest="checkpoint_path", type=str, default=str(DEFAULT_CHECKPOINT_PATH))
     add_checkpoint_args(parser)
     parser.add_argument(
@@ -3012,6 +3125,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     text_normalizer_manager.start()
     warmup_manager = WarmupManager(runtime, text_normalizer_manager=text_normalizer_manager)
     warmup_manager.start()
+
+    logging.info("Préchauffage synchrone du modèle et du service de streaming avant le démarrage HTTP…")
+    warmup_snapshot = warmup_manager.ensure_ready()
+    if warmup_snapshot.failed:
+        raise SystemExit(
+            f"Échec du préchauffage : {warmup_snapshot.error or warmup_snapshot.message}"
+        )
+    logging.info("Préchauffage terminé : %s", warmup_snapshot.message)
 
     vscode_proxy_uri = os.getenv("VSCODE_PROXY_URI", "")
     root_path = _resolve_vscode_root_path(vscode_proxy_uri, args.port)
